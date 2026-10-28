@@ -110,6 +110,9 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var human = RunCli("--db", Db, "status");
         Assert.DoesNotContain("{", human.Stdout);
         Assert.Contains("total:", human.Stdout);
+        var rebuilt = RunCli("--json", "--db", Db, "rebuild-index");
+        Assert.Equal(0, rebuilt.ExitCode);
+        Assert.True(JsonDocument.Parse(rebuilt.Stdout).RootElement.TryGetProperty("indexed", out _));
     }
 
     [Fact]
@@ -153,6 +156,79 @@ public sealed class ImportAndRecoveryTests : IDisposable
         }
         var status = store.Status(true);
         Assert.Contains("\"index_missing_sources\":1", JsonSerializer.Serialize(status));
+    }
+
+    [Fact]
+    public void VerifyDetectsOriginalAndExtractedTextTampering()
+    {
+        var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "integrity evidence");
+        var store = new KnowledgeBaseStore(Db); var id = store.Import(input).Items.Single().SourceId!.Value; var source = store.Show(id);
+        File.WriteAllText(Path.Combine(source.Directory, "original.txt"), "tampered original");
+        File.WriteAllText(Path.Combine(source.Directory, "extracted.txt"), "tampered evidence");
+        var status = JsonDocument.Parse(JsonSerializer.Serialize(store.Status(true))).RootElement;
+        Assert.False(status.GetProperty("verify_ok").GetBoolean());
+        var errors = status.GetProperty("verify_errors").EnumerateArray().Select(x => x.GetString()).ToArray();
+        Assert.Contains(errors, x => x!.Contains($"{id}: original_hash_mismatch", StringComparison.Ordinal));
+        Assert.Contains(errors, x => x!.Contains($"{id}: extracted_text_hash_mismatch", StringComparison.Ordinal));
+        var cli = RunCli("--json", "--db", Db, "status", "--verify");
+        Assert.Equal(1, cli.ExitCode);
+    }
+
+    [Fact]
+    public void MissingIndexSearchRequiresRebuildAndRebuildRejectsMissingIndexedText()
+    {
+        var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "index recoverable text");
+        var store = new KnowledgeBaseStore(Db); var id = store.Import(input).Items.Single().SourceId!.Value; var source = store.Show(id);
+        File.Delete(Path.Combine(Db, "index", "search.sqlite"));
+        Assert.Throws<InvalidDataException>(() => store.Search("recoverable"));
+        store.Rebuild(); Assert.Single(store.Search("recoverable"));
+        var before = File.ReadAllBytes(Path.Combine(Db, "index", "search.sqlite")); File.Delete(Path.Combine(source.Directory, "extracted.txt"));
+        Assert.Throws<InvalidDataException>(() => store.Rebuild());
+        Assert.Equal(before, File.ReadAllBytes(Path.Combine(Db, "index", "search.sqlite")));
+    }
+
+    [Fact]
+    public void MigrationBacksUpMetadataAndRecordCanBeReviewedAndArchived()
+    {
+        var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "A verified statement.\nMore context.");
+        var store = new KnowledgeBaseStore(Db); var id = store.Import(input).Items.Single().SourceId!.Value; var source = store.Show(id);
+        var migration = JsonSerializer.Serialize(store.Migrate(2));
+        Assert.Contains("migrated_sources", migration);
+        Assert.True(File.Exists(Path.Combine(source.Directory, "source.json.v1.bak")));
+        var draft = store.DraftRecord(id, "Verified statement", "The source says this.");
+        var accepted = store.AcceptRecord(draft.Metadata.Id, new[] { id });
+        Assert.Equal("reviewed", accepted.Metadata.Status);
+        var rejected = store.DraftRecord(id, "Another statement", "Needs review.");
+        var archived = store.RejectRecord(rejected.Metadata.Id, "Insufficient evidence");
+        Assert.Equal("archived", archived.Metadata.Status);
+        Assert.Equal("Insufficient evidence", archived.Metadata.RejectionReason);
+    }
+
+    [Fact]
+    public void ExtractedTextLimitStoresOriginalWithoutPartialText()
+    {
+        var store = new KnowledgeBaseStore(Db); store.Initialize();
+        File.WriteAllText(Path.Combine(Db, "config", "settings.json"), "{\"schema_version\":\"2\",\"max_file_size_bytes\":1000,\"max_extracted_text_bytes\":5}");
+        var input = Path.Combine(temp, "large.txt"); File.WriteAllText(input, "more than five bytes");
+        var item = Assert.Single(store.Import(input).Items); var source = store.Show(item.SourceId!.Value);
+        Assert.Equal("text_limit_exceeded", item.Status);
+        Assert.False(File.Exists(Path.Combine(source.Directory, "extracted.txt")));
+        Assert.True(File.Exists(Path.Combine(source.Directory, source.Record.OriginalRelativePath!)));
+    }
+
+    [Fact]
+    public void KnowledgeSearchDefaultsToReviewedAndRebuildIndexesPortableRecords()
+    {
+        var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "A distinctive evidence sentence.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var draft = store.DraftRecord(sourceId, "Distinctive reviewed claim", "The statement is distinctive.");
+        Assert.Empty(store.SearchKnowledge("distinctive"));
+        store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        Assert.Single(store.SearchKnowledge("distinctive"));
+        File.Delete(Path.Combine(Db, "index", "search.sqlite"));
+        Assert.Throws<InvalidDataException>(() => store.SearchKnowledge("distinctive"));
+        Assert.Equal(1, store.Rebuild().KnowledgeIndexed);
+        Assert.Single(store.SearchKnowledge("distinctive"));
     }
 
     [Fact]
@@ -203,7 +279,10 @@ public sealed class ImportAndRecoveryTests : IDisposable
         public string DatabasePath => inner.DatabasePath;
         public void Ensure() => inner.Ensure();
         public void Index(SourceRecord record, string body) => throw new IOException("injected index failure");
-        public (int Indexed, int Skipped) Rebuild(IEnumerable<(SourceRecord Record, string Directory)> sources, int expected) => inner.Rebuild(sources, expected);
+        public (int Indexed, int Skipped, int KnowledgeIndexed) Rebuild(IEnumerable<(SourceRecord Record, string Directory)> sources, int expected, IReadOnlyCollection<KnowledgeRecordView>? knowledge = null) => inner.Rebuild(sources, expected, knowledge);
+        public void IndexKnowledge(KnowledgeRecordView record) => inner.IndexKnowledge(record);
+        public IReadOnlyList<KnowledgeSearchResult> SearchKnowledge(string query, int limit, string? status) => inner.SearchKnowledge(query, limit, status);
+        public IReadOnlyList<string> VerifyKnowledge(IReadOnlyCollection<KnowledgeRecordView> records) => inner.VerifyKnowledge(records);
         public (string Integrity, int Missing, int Extra, int Count) Verify(IReadOnlyCollection<SourceRecord> records) => inner.Verify(records);
         public IReadOnlyList<SearchResult> Search(string query, int limit, string? sourceType, DateTimeOffset? from, DateTimeOffset? to, string? status) => inner.Search(query, limit, sourceType, from, to, status);
     }
