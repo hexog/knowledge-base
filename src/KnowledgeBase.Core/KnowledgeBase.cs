@@ -509,7 +509,6 @@ public sealed class KnowledgeBaseStore
         return index.Search(query, limit, sourceType, from, to, status)
             .Select(result => paths.TryGetValue(result.SourceId, out var path) ? result with { SourcePath = path } : result).ToArray();
     }
-    public IReadOnlyList<KnowledgeSearchResult> SearchKnowledge(string query, int limit = 10, string? recordStatus = "reviewed") => index.SearchKnowledge(query, limit, recordStatus);
     public (SourceRecord Record, string Directory) Show(Guid id)
     {
         var hit = repository.ReadSources().FirstOrDefault(x => x.Record.SourceId == id);
@@ -537,7 +536,17 @@ public sealed class KnowledgeBaseStore
             if (check.Item1 != "ok") integrityErrors.Add($"index: {check.Item1}");
             if (check.Item2 != 0) integrityErrors.Add($"index: {check.Item2} missing_or_duplicate_rows");
             if (check.Item3 != 0) integrityErrors.Add($"index: {check.Item3} extra_rows");
-            try { integrityErrors.AddRange(index.VerifyKnowledge(knowledge.List())); }
+            try
+            {
+                var knowledgeRecords = knowledge.List();
+                integrityErrors.AddRange(knowledgeRecords.Where(x => x.StaleReason is not null).Select(x => $"{x.Metadata.Id}: stale ({x.StaleReason})"));
+                var knowledgeIds = knowledgeRecords.Select(x => x.Metadata.Id).ToHashSet();
+                foreach (var record in knowledgeRecords)
+                    foreach (var relation in record.Metadata.RelatedRecords ?? Array.Empty<RelatedRecord>())
+                        if (!knowledgeIds.Contains(relation.RecordId)) integrityErrors.Add($"{record.Metadata.Id}: related_record_missing ({relation.RecordId})");
+                integrityErrors.AddRange(knowledge.VerifyHistory());
+                integrityErrors.AddRange(index.VerifyKnowledge(knowledgeRecords));
+            }
             catch (Exception ex) { integrityErrors.Add($"knowledge: invalid_record ({ex.Message})"); }
         }
         return new
@@ -559,9 +568,9 @@ public sealed class KnowledgeBaseStore
     }
     public RebuildResult Rebuild()
     {
-        using var operation = AcquireLock(); Initialize(); var problems = new List<string>(); var records = repository.ReadSources(problems).ToArray();
+        using var operation = AcquireLock(); Initialize(); knowledge.RecoverPendingTransitions(); var problems = new List<string>(); var records = repository.ReadSources(problems).ToArray();
         if (problems.Count > 0) throw new InvalidDataException("Cannot rebuild index because source metadata is invalid: " + string.Join("; ", problems));
-        var knowledgeRecords = knowledge.List();
+        var knowledgeRecords = knowledge.ListCanonical();
         var result = index.Rebuild(records, records.Length, knowledgeRecords);
         return new RebuildResult(result.Indexed, result.Skipped, result.KnowledgeIndexed);
     }
@@ -570,34 +579,132 @@ public sealed class KnowledgeBaseStore
     {
         if (targetVersion != 2) throw new ArgumentOutOfRangeException(nameof(targetVersion), "Only migration target 2 is supported");
         using var operation = AcquireLock();
+        RecoverMigration();
+        Initialize();
         var problems = new List<string>(); var records = repository.ReadSources(problems).ToArray();
         if (problems.Count > 0) throw new InvalidDataException("Cannot migrate invalid metadata: " + string.Join("; ", problems));
+        var currentSettingsVersion = File.Exists(SettingsPath) ? JsonDocument.Parse(File.ReadAllText(SettingsPath)).RootElement.GetProperty("schema_version").GetString() : "1";
+        if (records.All(x => x.Record.SchemaVersion == "2") && currentSettingsVersion == "2") return new { schema_version = "2", migrated_sources = 0, backups = Array.Empty<string>(), already_current = true };
         var missingText = records.Where(x => x.Record.Extractor.Status == "indexed" && !File.Exists(Path.Combine(x.Directory, "extracted.txt"))).Select(x => $"{x.Record.SourceId}: extracted_text_missing").ToArray();
         if (missingText.Length > 0) throw new InvalidDataException("Cannot migrate indexed sources without extracted text: " + string.Join("; ", missingText));
-        var migrated = 0; var backups = new List<string>();
+        var backups = new List<string>(); var changes = new List<MigrationChange>();
         foreach (var (record, dir) in records)
         {
-            var metadata = Path.Combine(dir, "source.json"); var backup = metadata + ".v1.bak";
+            var metadata = Path.Combine(dir, "source.json");
+            var backup = metadata + ".v1.bak"; _ = SafeMigrationPath(Path.GetRelativePath(root, metadata)); _ = SafeMigrationPath(Path.GetRelativePath(root, backup));
             if (!File.Exists(backup)) { File.Copy(metadata, backup); backups.Add(backup); }
+            var updated = record with { SchemaVersion = "2" };
             var textPath = Path.Combine(dir, "extracted.txt"); string? hash = null;
             if (record.Extractor.Status == "indexed" && File.Exists(textPath))
             {
-                var normalized = NormalizeLf(File.ReadAllText(textPath, Encoding.UTF8)); File.WriteAllText(textPath, normalized, new UTF8Encoding(false)); hash = HashText(normalized);
+                var textBackup = textPath + ".v1.bak"; _ = SafeMigrationPath(Path.GetRelativePath(root, textPath)); _ = SafeMigrationPath(Path.GetRelativePath(root, textBackup));
+                if (!File.Exists(textBackup)) { File.Copy(textPath, textBackup); backups.Add(textBackup); }
+                var normalized = NormalizeLf(File.ReadAllText(textPath, Encoding.UTF8)); hash = HashText(normalized);
+                changes.Add(PrepareMigrationChange(textPath, normalized, "extracted"));
             }
-            SourceRepository.SaveRecord(dir, record with { SchemaVersion = "2", ExtractedTextSha256 = hash }); migrated++;
+            updated = updated with { ExtractedTextSha256 = hash };
+            changes.Add(PrepareMigrationChange(metadata, JsonSerializer.Serialize(updated, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n", "metadata"));
         }
+        if (File.Exists(SettingsPath)) { var settingsBackup = SettingsPath + ".v1.bak"; _ = SafeMigrationPath(Path.GetRelativePath(root, SettingsPath)); _ = SafeMigrationPath(Path.GetRelativePath(root, settingsBackup)); if (!File.Exists(settingsBackup)) { File.Copy(SettingsPath, settingsBackup); backups.Add(settingsBackup); } }
         var settings = new { schema_version = "2", max_file_size_bytes = ReadMaxFileSize(), max_extracted_text_bytes = ReadMaxExtractedTextBytes() };
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n");
-        return new { schema_version = "2", migrated_sources = migrated, backups };
+        changes.Add(PrepareMigrationChange(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n", "settings"));
+        var journalPath = MigrationJournalPath;
+        WriteMigrationJournal(journalPath, changes, 0);
+        CommitMigration(journalPath, changes, 0);
+        return new { schema_version = "2", migrated_sources = records.Count(x => x.Record.SchemaVersion != "2"), backups, entries = changes.Select(x => new { x.Kind, x.Target, x.Sha256 }) };
+    }
+
+    private string MigrationJournalPath => Path.Combine(root, ".migration-v2.json");
+    private MigrationChange PrepareMigrationChange(string target, string content, string kind)
+    {
+        var staged = target + ".v2.new"; _ = SafeMigrationPath(Path.GetRelativePath(root, target)); _ = SafeMigrationPath(Path.GetRelativePath(root, staged)); File.WriteAllText(staged, content, new UTF8Encoding(false));
+        return new MigrationChange(Path.GetRelativePath(root, target), Path.GetRelativePath(root, staged), HashText(content), File.Exists(target) ? HashFile(target) : null, kind);
+    }
+    private sealed record MigrationChange(string Target, string Staged, string Sha256, string? OriginalSha256, string Kind);
+    private void WriteMigrationJournal(string path, IReadOnlyList<MigrationChange> changes, int completed)
+    {
+        _ = SafeMigrationPath(Path.GetRelativePath(root, path));
+        var temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        _ = SafeMigrationPath(Path.GetRelativePath(root, temp));
+        var options = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        File.WriteAllText(temp, JsonSerializer.Serialize(new { format_version = 1, phase = "committing", completed, changes }, options), new UTF8Encoding(false));
+        File.Move(temp, path, true);
+    }
+    private void CommitMigration(string path, IReadOnlyList<MigrationChange> changes, int completed)
+    {
+        for (var i = completed; i < changes.Count; i++)
+        {
+            var change = changes[i]; var target = SafeMigrationPath(change.Target); var staged = SafeMigrationPath(change.Staged);
+            if (File.Exists(staged))
+            {
+                if (File.Exists(target) && !string.Equals(HashFile(target), change.OriginalSha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Migration target changed unexpectedly: {change.Target}");
+                if (!File.Exists(target) && change.OriginalSha256 is not null) throw new InvalidDataException($"Migration target disappeared unexpectedly: {change.Target}");
+                File.Move(staged, target, true);
+            }
+            else if (!File.Exists(target) || !string.Equals(HashFile(target), change.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Migration stopped at {change.Kind}: neither staged file nor target matches expected hash; restore backups and remove {path} after inspection");
+            WriteMigrationJournal(path, changes, i + 1);
+        }
+        File.Delete(path);
+    }
+    private void RecoverMigration()
+    {
+        _ = SafeMigrationPath(Path.GetRelativePath(root, MigrationJournalPath));
+        if (!File.Exists(MigrationJournalPath)) return;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(MigrationJournalPath)); var rootElement = document.RootElement;
+            if (rootElement.GetProperty("format_version").GetInt32() != 1) throw new InvalidDataException("unsupported migration journal version");
+            var changes = rootElement.GetProperty("changes").EnumerateArray().Select(x => new MigrationChange(x.GetProperty("target").GetString()!, x.GetProperty("staged").GetString()!, x.GetProperty("sha256").GetString()!, x.TryGetProperty("originalSha256", out var original) ? original.GetString() : null, x.GetProperty("kind").GetString()!)).ToArray();
+            CommitMigration(MigrationJournalPath, changes, rootElement.GetProperty("completed").GetInt32());
+        }
+        catch (Exception ex) { throw new InvalidDataException($"Migration recovery stopped. Inspect backups (*.v1.bak) and {MigrationJournalPath}: {ex.Message}", ex); }
+    }
+    private string SafeMigrationPath(string relative)
+    {
+        if (Path.IsPathRooted(relative)) throw new InvalidDataException("migration journal contains an absolute path");
+        var path = Path.GetFullPath(Path.Combine(root, relative)); var prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(prefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) throw new InvalidDataException("migration journal path escapes database root");
+        for (var current = path; current.StartsWith(prefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal); current = Path.GetDirectoryName(current)!)
+            if ((File.Exists(current) || Directory.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("migration journal path traverses a symbolic link");
+        return path;
     }
 
     public IReadOnlyList<KnowledgeRecordView> ListRecords(string? status = null) => knowledge.List(status);
     public KnowledgeRecordView ShowRecord(Guid id) => knowledge.Show(id);
     public IReadOnlyList<object> ShowRecordSources(Guid id) => knowledge.ShowSources(id);
-    public KnowledgeRecordView DraftRecord(Guid sourceId, string title, string body, string type = "fact", string kind = "source_claim") { var record = knowledge.Draft(sourceId, title, body, type, kind); index.IndexKnowledge(record); return record; }
-    public KnowledgeRecordView DraftCandidate(Guid sourceId, string title, string body, int startLine, int endLine, string quote, string type = "fact", string kind = "source_claim") { var record = knowledge.DraftCandidate(sourceId, title, body, startLine, endLine, quote, type, kind); index.IndexKnowledge(record); return record; }
-    public KnowledgeRecordView EditRecord(Guid id, string markdown) { var record = knowledge.Edit(id, markdown); index.IndexKnowledge(record); return record; }
-    public KnowledgeRecordView AcceptRecord(Guid id, IReadOnlyCollection<Guid> confirmedSources) { var record = knowledge.Accept(id, confirmedSources); index.IndexKnowledge(record); return record; }
-    public KnowledgeRecordView RejectRecord(Guid id, string reason) { var record = knowledge.Reject(id, reason); index.IndexKnowledge(record); return record; }
+    public IReadOnlyList<object> ShowRecordRelations(Guid id)
+    {
+        var records = knowledge.ListCanonical(); var target = records.SingleOrDefault(x => x.Metadata.Id == id) ?? throw new FileNotFoundException($"Knowledge record {id} was not found");
+        var relations = (target.Metadata.RelatedRecords ?? Array.Empty<RelatedRecord>()).Select(x => new { type = x.Type, record_id = x.RecordId, direction = "outgoing" })
+            .Concat(records.Where(x => x.Metadata.Id != id).SelectMany(x => (x.Metadata.RelatedRecords ?? Array.Empty<RelatedRecord>())
+                .Where(r => r.Type == "conflicts_with" && r.RecordId == id).Select(_ => new { type = "conflicts_with", record_id = x.Metadata.Id, direction = "incoming" })))
+            .Select(x => (object)x).ToArray();
+        return relations;
+    }
+    public IReadOnlyList<KnowledgeSearchResult> SearchKnowledge(string query, int limit = 10, string? recordStatus = "reviewed")
+    {
+        var candidates = index.SearchKnowledge(query, Math.Clamp(limit * 5, 1, 100), recordStatus == "stale" ? null : recordStatus);
+        var live = knowledge.List().ToDictionary(x => x.Metadata.Id);
+        return candidates.Where(x => live.TryGetValue(x.Id, out var current) && (recordStatus is null || current.Metadata.Status == recordStatus))
+            .Select(x => live.TryGetValue(x.Id, out var current) ? x with { Status = current.Metadata.Status } : x).Take(Math.Clamp(limit, 1, 100)).ToArray();
+    }
+    public KnowledgeRecordView DraftRecord(Guid sourceId, string title, string body, string type = "fact", string kind = "source_claim") => knowledge.Draft(sourceId, title, body, type, kind);
+    public KnowledgeRecordView DraftCandidate(Guid sourceId, string title, string body, int startLine, int endLine, string quote, string type = "fact", string kind = "source_claim", string? operationId = null, string? adapterVersion = null, string? modelVersion = null)
+    {
+        return knowledge.DraftCandidate(sourceId, title, body, startLine, endLine, quote, type, kind, operationId, adapterVersion, modelVersion, index.IndexKnowledge);
+    }
+    public KnowledgeRecordView EditRecord(Guid id, string markdown, string? expectedFileHash = null)
+    {
+        return knowledge.Edit(id, markdown, expectedFileHash, index.IndexKnowledge);
+    }
+    public KnowledgeRecordView AcceptRecord(Guid id, IReadOnlyCollection<Guid> confirmedSources)
+    {
+        return knowledge.Accept(id, confirmedSources, index.IndexKnowledge);
+    }
+    public KnowledgeRecordView RejectRecord(Guid id, string reason)
+    {
+        return knowledge.Reject(id, reason, index.IndexKnowledge);
+    }
 }

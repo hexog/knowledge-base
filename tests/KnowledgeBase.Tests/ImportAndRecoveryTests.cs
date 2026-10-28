@@ -116,6 +116,23 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void CliCreatesShowsAcceptsAndSearchesCitationBackedRecord()
+    {
+        var input = Path.Combine(temp, "cli-evidence.txt"); File.WriteAllText(input, "Exact CLI citation.\nAdditional context.");
+        var imported = RunCli("--json", "--db", Db, "import", input);
+        var sourceId = JsonDocument.Parse(imported.Stdout).RootElement.GetProperty("items")[0].GetProperty("source_id").GetGuid();
+        var draft = RunCli("--json", "--db", Db, "record", "draft", "--source", sourceId.ToString(), "--title", "CLI knowledge claim", "--body", "The claim has evidence.", "--start-line", "1", "--end-line", "1", "--quote", "Exact CLI citation.");
+        Assert.Equal(0, draft.ExitCode);
+        var recordId = JsonDocument.Parse(draft.Stdout).RootElement.GetProperty("record").GetProperty("metadata").GetProperty("id").GetGuid();
+        var shown = RunCli("--json", "--db", Db, "record", "show", recordId.ToString(), "--sources");
+        Assert.Equal("Exact CLI citation.", JsonDocument.Parse(shown.Stdout).RootElement.GetProperty("sources")[0].GetProperty("quote").GetString());
+        var accepted = RunCli("--json", "--db", Db, "record", "accept", recordId.ToString(), "--confirm-source", sourceId.ToString());
+        Assert.Equal("reviewed", JsonDocument.Parse(accepted.Stdout).RootElement.GetProperty("metadata").GetProperty("status").GetString());
+        var results = RunCli("--json", "--db", Db, "search", "knowledge", "--scope", "knowledge", "--record-status", "reviewed");
+        Assert.Equal(recordId, JsonDocument.Parse(results.Stdout).RootElement[0].GetProperty("id").GetGuid());
+    }
+
+    [Fact]
     public void RebuildFailureKeepsWorkingIndexAndSuccessfulRebuildRecovers()
     {
         var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "recoverable falcon document");
@@ -195,13 +212,16 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var migration = JsonSerializer.Serialize(store.Migrate(2));
         Assert.Contains("migrated_sources", migration);
         Assert.True(File.Exists(Path.Combine(source.Directory, "source.json.v1.bak")));
-        var draft = store.DraftRecord(id, "Verified statement", "The source says this.");
+        var draft = store.DraftCandidate(id, "Verified statement", "The source says this.", 1, 1, "A verified statement.");
         var accepted = store.AcceptRecord(draft.Metadata.Id, new[] { id });
         Assert.Equal("reviewed", accepted.Metadata.Status);
-        var rejected = store.DraftRecord(id, "Another statement", "Needs review.");
+        var rejected = store.DraftCandidate(id, "Another statement", "Needs review.", 1, 1, "A verified statement.");
         var archived = store.RejectRecord(rejected.Metadata.Id, "Insufficient evidence");
         Assert.Equal("archived", archived.Metadata.Status);
         Assert.Equal("Insufficient evidence", archived.Metadata.RejectionReason);
+        var metadataBeforeRepeat = File.ReadAllBytes(Path.Combine(source.Directory, "source.json"));
+        store.Migrate(2);
+        Assert.Equal(metadataBeforeRepeat, File.ReadAllBytes(Path.Combine(source.Directory, "source.json")));
     }
 
     [Fact]
@@ -221,7 +241,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
     {
         var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "A distinctive evidence sentence.");
         var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
-        var draft = store.DraftRecord(sourceId, "Distinctive reviewed claim", "The statement is distinctive.");
+        var draft = store.DraftCandidate(sourceId, "Distinctive reviewed claim", "The statement is distinctive.", 1, 1, "A distinctive evidence sentence.");
         Assert.Empty(store.SearchKnowledge("distinctive"));
         store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
         Assert.Single(store.SearchKnowledge("distinctive"));
@@ -229,6 +249,157 @@ public sealed class ImportAndRecoveryTests : IDisposable
         Assert.Throws<InvalidDataException>(() => store.SearchKnowledge("distinctive"));
         Assert.Equal(1, store.Rebuild().KnowledgeIndexed);
         Assert.Single(store.SearchKnowledge("distinctive"));
+    }
+
+    [Fact]
+    public void ReviewedRecordBecomesStaleWhenExtractedEvidenceChanges()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "Evidence remains unchanged.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var draft = store.DraftCandidate(sourceId, "A claim", "A supported claim.", 1, 1, "Evidence remains unchanged.");
+        store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        File.WriteAllText(Path.Combine(store.Show(sourceId).Directory, "extracted.txt"), "Evidence was externally changed.");
+        var shown = store.ShowRecord(draft.Metadata.Id);
+        Assert.Equal("stale", shown.Metadata.Status);
+        Assert.Equal("source_changed_or_quote_mismatch", shown.StaleReason);
+        Assert.Empty(store.SearchKnowledge("claim"));
+        Assert.Single(store.SearchKnowledge("claim", 10, "stale"));
+        File.WriteAllText(Path.Combine(store.Show(sourceId).Directory, "extracted.txt"), "Evidence remains unchanged.");
+        var markdown = File.ReadAllText(shown.Path).Replace("A supported claim.", "An externally altered claim.", StringComparison.Ordinal);
+        File.WriteAllText(shown.Path, markdown);
+        var changedRecord = store.ShowRecord(draft.Metadata.Id);
+        Assert.Equal("stale", changedRecord.Metadata.Status);
+        Assert.Equal("record_content_changed", changedRecord.StaleReason);
+        var status = JsonDocument.Parse(JsonSerializer.Serialize(store.Status(true))).RootElement;
+        Assert.Contains(status.GetProperty("verify_errors").EnumerateArray().Select(x => x.GetString()), x => x!.Contains("stale (record_content_changed)", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EditingReviewedRecordKeepsUnchangedReviewAndArchivesChangedVersion()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "Exact citation.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var draft = store.DraftCandidate(sourceId, "Reviewed title", "Original body.", 1, 1, "Exact citation.");
+        store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        var reviewed = store.ShowRecord(draft.Metadata.Id); var unchanged = File.ReadAllText(reviewed.Path);
+        Assert.Equal("reviewed", store.EditRecord(draft.Metadata.Id, unchanged, KnowledgeRepository.FileHash(unchanged)).Metadata.Status);
+        var changed = unchanged.Replace("Original body.", "Edited body.", StringComparison.Ordinal);
+        var edited = store.EditRecord(draft.Metadata.Id, changed, KnowledgeRepository.FileHash(unchanged));
+        Assert.Equal("draft", edited.Metadata.Status);
+        Assert.Null(edited.Metadata.ReviewedContentSha256);
+        Assert.Equal(2, Directory.GetFiles(Path.Combine(Db, "knowledge", "history", draft.Metadata.Id.ToString()), "*.md").Length);
+    }
+
+    [Fact]
+    public void ConcurrentEditorSaveFailsWithoutReplacingTheNewVersion()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "Exact citation.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var draft = store.DraftCandidate(sourceId, "Concurrent title", "Original body.", 1, 1, "Exact citation.");
+        var original = File.ReadAllText(draft.Path); var changedInEditor = original.Replace("Original body.", "My editor copy.", StringComparison.Ordinal);
+        File.WriteAllText(draft.Path, original.Replace("Original body.", "Other editor copy.", StringComparison.Ordinal));
+        Assert.Throws<IOException>(() => store.EditRecord(draft.Metadata.Id, changedInEditor, KnowledgeRepository.FileHash(original)));
+        Assert.Contains("Other editor copy.", File.ReadAllText(draft.Path));
+    }
+
+    [Fact]
+    public void RecordValidationRejectsUnknownFieldsAndUncitedInference()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "A verifiable sentence.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var draft = store.DraftCandidate(sourceId, "Validation claim", "A body.", 1, 1, "A verifiable sentence.");
+        var markdown = File.ReadAllText(draft.Path);
+        Assert.Throws<InvalidDataException>(() => store.EditRecord(draft.Metadata.Id, markdown.Replace("\n---\n", "\ncustom_field: silently_bad\n---\n", StringComparison.Ordinal)));
+        var sourceRefsStart = markdown.IndexOf("source_refs:", StringComparison.Ordinal);
+        var historyStart = markdown.IndexOf("\nhistory:", sourceRefsStart, StringComparison.Ordinal);
+        var uncited = markdown[..sourceRefsStart] + "source_refs: []" + markdown[historyStart..];
+        uncited = uncited.Replace("kind: source_claim", "kind: inference", StringComparison.Ordinal);
+        store.EditRecord(draft.Metadata.Id, uncited);
+        Assert.Throws<InvalidDataException>(() => store.AcceptRecord(draft.Metadata.Id, Array.Empty<Guid>()));
+        Assert.Throws<InvalidDataException>(() => store.DraftCandidate(sourceId, "Bad quote", "Body.", 1, 1, "A different sentence."));
+    }
+
+    [Fact]
+    public void FailedKnowledgeIndexingReturnsSavedIndexStaleAndRebuildRecovers()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "Index recovery citation.");
+        var baseStore = new KnowledgeBaseStore(Db); var sourceId = baseStore.Import(input).Items.Single().SourceId!.Value;
+        var store = new KnowledgeBaseStore(Db, searchIndex: new FailingKnowledgeIndex(new SearchIndex(Db)));
+        var draft = store.DraftCandidate(sourceId, "Index failure claim", "The body.", 1, 1, "Index recovery citation.");
+        Assert.StartsWith("saved_index_stale:", draft.IndexStatus);
+        Assert.Equal("draft", store.ShowRecord(draft.Metadata.Id).Metadata.Status);
+        Assert.Equal(1, store.Rebuild().KnowledgeIndexed);
+        Assert.Single(store.SearchKnowledge("failure", 10, "draft"));
+    }
+
+    [Fact]
+    public void ConflictsAreVisibleFromBothRecordsAndMissingTargetsAreRejected()
+    {
+        var input = Path.Combine(temp, "source.txt"); File.WriteAllText(input, "Shared source evidence.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var earlier = store.DraftCandidate(sourceId, "Earlier claim", "Earlier body.", 1, 1, "Shared source evidence.");
+        var newer = store.DraftCandidate(sourceId, "Newer claim", "Newer body.", 1, 1, "Shared source evidence.");
+        var markdown = File.ReadAllText(newer.Path);
+        var relation = $"related_records:\n- type: conflicts_with\n  record_id: {earlier.Metadata.Id}";
+        var frontMatterEnd = markdown.IndexOf("\n---\n", 4, StringComparison.Ordinal);
+        var yaml = markdown[4..frontMatterEnd];
+        var replaced = System.Text.RegularExpressions.Regex.Replace(yaml, "(?ms)^related_records:.*?(?=^[A-Za-z_][A-Za-z0-9_]*:|\\z)", relation + "\n");
+        if (replaced == yaml) replaced += "\n" + relation;
+        markdown = "---\n" + replaced + markdown[frontMatterEnd..];
+        store.EditRecord(newer.Metadata.Id, markdown);
+        store.AcceptRecord(newer.Metadata.Id, new[] { sourceId });
+        Assert.Contains(store.ShowRecord(newer.Metadata.Id).Metadata.RelatedRecords ?? Array.Empty<RelatedRecord>(), x => x.RecordId == earlier.Metadata.Id);
+        var incoming = Assert.Single(store.ShowRecordRelations(earlier.Metadata.Id));
+        Assert.Contains("incoming", JsonSerializer.Serialize(incoming));
+
+        var currentPath = store.ShowRecord(newer.Metadata.Id).Path;
+        var missingMarkdown = File.ReadAllText(currentPath).Replace(earlier.Metadata.Id.ToString(), Guid.NewGuid().ToString(), StringComparison.Ordinal);
+        store.EditRecord(newer.Metadata.Id, missingMarkdown);
+        Assert.Throws<InvalidDataException>(() => store.AcceptRecord(newer.Metadata.Id, new[] { sourceId }));
+    }
+
+    [Fact]
+    public void MigrationResumesPreparedJournalForward()
+    {
+        var input = Path.Combine(temp, "legacy.txt"); File.WriteAllText(input, "Migration recovery text.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value; var source = store.Show(sourceId);
+        var settingsPath = Path.Combine(Db, "config", "settings.json"); var stagedPath = settingsPath + ".v2.new";
+        var currentSettings = File.ReadAllText(settingsPath); var migratedSettings = "{\"schema_version\":\"2\",\"max_file_size_bytes\":52428800,\"max_extracted_text_bytes\":10485760}\n";
+        File.WriteAllText(stagedPath, migratedSettings);
+        static string Hash(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+        var journal = new
+        {
+            format_version = 1,
+            phase = "committing",
+            completed = 0,
+            changes = new[] { new { target = "config/settings.json", staged = "config/settings.json.v2.new", sha256 = Hash(migratedSettings), originalSha256 = Hash(currentSettings), kind = "settings" } }
+        };
+        File.WriteAllText(Path.Combine(Db, ".migration-v2.json"), JsonSerializer.Serialize(journal));
+        store.Migrate(2);
+        Assert.False(File.Exists(Path.Combine(Db, ".migration-v2.json")));
+        Assert.Equal("2", JsonDocument.Parse(File.ReadAllText(Path.Combine(source.Directory, "source.json"))).RootElement.GetProperty("schema_version").GetString());
+    }
+
+    [Fact]
+    public void LocalExtractorKeepsValidPartialResultsAndRejectsMalformedOrOversizedProcessOutput()
+    {
+        var input = Path.Combine(temp, "extractor-source.txt"); File.WriteAllText(input, "Extractor evidence line.\nSecond line.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var success = RunExtractor(sourceId, "valid_mixed");
+        Assert.Equal(0, success.ExitCode);
+        var result = JsonDocument.Parse(success.Stdout).RootElement;
+        Assert.Single(result.GetProperty("created").EnumerateArray());
+        Assert.Equal(2, result.GetProperty("errors").GetArrayLength());
+        Assert.NotNull(result.GetProperty("created")[0].GetProperty("metadata").GetProperty("operation_id").GetString());
+        Assert.Equal("local-process-v1", result.GetProperty("created")[0].GetProperty("metadata").GetProperty("adapter_version").GetString());
+        Assert.Single(store.ListRecords());
+
+        foreach (var mode in new[] { "no_read", "over_stdout", "over_stderr", "exit_error", "malformed_json" })
+        {
+            var failed = RunExtractor(sourceId, mode);
+            Assert.NotEqual(0, failed.ExitCode);
+            Assert.Single(store.ListRecords());
+        }
     }
 
     [Fact]
@@ -243,9 +414,25 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     private (int ExitCode, string Stdout, string Stderr) RunCli(params string[] arguments)
+        => RunCliWithEnvironment(null, arguments);
+
+    private (int ExitCode, string Stdout, string Stderr) RunExtractor(Guid sourceId, string mode)
+    {
+        var child = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../ExtractorTestProcess/bin/Debug/net10.0/ExtractorTestProcess.dll"));
+        var environment = new Dictionary<string, string>
+        {
+            ["KB_LOCAL_EXTRACTOR_EXECUTABLE"] = "dotnet",
+            ["KB_LOCAL_EXTRACTOR_ARGUMENTS"] = JsonSerializer.Serialize(new[] { child, mode })
+        };
+        return RunCliWithEnvironment(environment, "--json", "--db", Db, "extract", "--source", sourceId.ToString());
+    }
+
+    private (int ExitCode, string Stdout, string Stderr) RunCliWithEnvironment(IReadOnlyDictionary<string, string>? environment, params string[] arguments)
     {
         var assembly = Path.Combine(AppContext.BaseDirectory, "KnowledgeBase.Cli.dll");
         var start = new ProcessStartInfo("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        start.Environment.Remove("EDITOR"); start.Environment.Remove("VISUAL");
+        if (environment is not null) foreach (var (key, value) in environment) start.Environment[key] = value;
         start.ArgumentList.Add(assembly); foreach (var argument in arguments) start.ArgumentList.Add(argument);
         using var process = Process.Start(start)!; var stdout = process.StandardOutput.ReadToEnd(); var stderr = process.StandardError.ReadToEnd(); process.WaitForExit();
         return (process.ExitCode, stdout, stderr);
@@ -281,6 +468,19 @@ public sealed class ImportAndRecoveryTests : IDisposable
         public void Index(SourceRecord record, string body) => throw new IOException("injected index failure");
         public (int Indexed, int Skipped, int KnowledgeIndexed) Rebuild(IEnumerable<(SourceRecord Record, string Directory)> sources, int expected, IReadOnlyCollection<KnowledgeRecordView>? knowledge = null) => inner.Rebuild(sources, expected, knowledge);
         public void IndexKnowledge(KnowledgeRecordView record) => inner.IndexKnowledge(record);
+        public IReadOnlyList<KnowledgeSearchResult> SearchKnowledge(string query, int limit, string? status) => inner.SearchKnowledge(query, limit, status);
+        public IReadOnlyList<string> VerifyKnowledge(IReadOnlyCollection<KnowledgeRecordView> records) => inner.VerifyKnowledge(records);
+        public (string Integrity, int Missing, int Extra, int Count) Verify(IReadOnlyCollection<SourceRecord> records) => inner.Verify(records);
+        public IReadOnlyList<SearchResult> Search(string query, int limit, string? sourceType, DateTimeOffset? from, DateTimeOffset? to, string? status) => inner.Search(query, limit, sourceType, from, to, status);
+    }
+
+    private sealed class FailingKnowledgeIndex(ISearchIndex inner) : ISearchIndex
+    {
+        public string DatabasePath => inner.DatabasePath;
+        public void Ensure() => inner.Ensure();
+        public void Index(SourceRecord record, string body) => inner.Index(record, body);
+        public (int Indexed, int Skipped, int KnowledgeIndexed) Rebuild(IEnumerable<(SourceRecord Record, string Directory)> sources, int expected, IReadOnlyCollection<KnowledgeRecordView>? knowledge = null) => inner.Rebuild(sources, expected, knowledge);
+        public void IndexKnowledge(KnowledgeRecordView record) => throw new IOException("injected knowledge index failure");
         public IReadOnlyList<KnowledgeSearchResult> SearchKnowledge(string query, int limit, string? status) => inner.SearchKnowledge(query, limit, status);
         public IReadOnlyList<string> VerifyKnowledge(IReadOnlyCollection<KnowledgeRecordView> records) => inner.VerifyKnowledge(records);
         public (string Integrity, int Missing, int Extra, int Count) Verify(IReadOnlyCollection<SourceRecord> records) => inner.Verify(records);

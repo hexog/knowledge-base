@@ -14,5 +14,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/KnowledgeBase.Core/KnowledgeBase.Core.csproj" />
     <ProjectReference Include="../../src/KnowledgeBase.Cli/KnowledgeBase.Cli.csproj" />
+    <ProjectReference Include="../ExtractorTestProcess/ExtractorTestProcess.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>
