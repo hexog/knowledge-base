@@ -418,7 +418,11 @@ public sealed class ImportAndRecoveryTests : IDisposable
 
     private (int ExitCode, string Stdout, string Stderr) RunExtractor(Guid sourceId, string mode)
     {
-        var child = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../ExtractorTestProcess/bin/Debug/net10.0/ExtractorTestProcess.dll"));
+        var output = new DirectoryInfo(AppContext.BaseDirectory);
+        var targetFramework = output.Name;
+        var configuration = output.Parent?.Name ?? throw new InvalidOperationException("Could not determine test build configuration");
+        var child = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, $"../../../../ExtractorTestProcess/bin/{configuration}/{targetFramework}/ExtractorTestProcess.dll"));
+        if (!File.Exists(child)) throw new FileNotFoundException("Extractor test child was not built for the current configuration", child);
         var environment = new Dictionary<string, string>
         {
             ["KB_LOCAL_EXTRACTOR_EXECUTABLE"] = "dotnet",
