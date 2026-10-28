@@ -36,17 +36,19 @@ public sealed class AgentKnowledgeService
         SearchSession session; var offset = 0; string? consumedCursor = null;
         if (cursor is null)
         {
-            var records = store.ListRecords().Where(x => termsMatch(x, query)).OrderBy(x => x.Metadata.Id).Take(MaxCandidatesPerSession + 1).ToArray();
-            if (records.Length > MaxCandidatesPerSession) throw new IOException("search_session_limit");
-            var resolved = new List<SearchCandidate>(records.Length);
+            var records = store.ListRecords().Where(x => termsMatch(x, query)).OrderBy(x => x.Metadata.Id);
+            var resolved = new List<SearchCandidate>();
             foreach (var candidate in records)
             {
+                AgentRecord? item;
                 try
                 {
-                    var item = Resolve(candidate.Metadata.Id, profile);
-                    if (item is not null) resolved.Add(new(item.Id, item.Version, item.Status, item.Citations.Select(c => new SourceDependency(c.SourceId, c.TextSha256, c.StartLine, c.EndLine)).ToArray()));
+                    item = Resolve(candidate, profile);
                 }
-                catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException) { }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException) { continue; }
+                if (item is null) continue;
+                if (resolved.Count == MaxCandidatesPerSession) throw new IOException("search_session_limit");
+                resolved.Add(new(item.Id, item.Version, item.Status, item.Citations.Select(c => new SourceDependency(c.SourceId, c.TextSha256, c.StartLine, c.EndLine)).ToArray()));
             }
             var encoded = JsonSerializer.SerializeToUtf8Bytes(resolved).Length + Encoding.UTF8.GetByteCount(clientId + profile + scopeDigest + queryDigest);
             if (encoded > MaxSessionBytes) throw new IOException("search_session_limit");
@@ -136,9 +138,15 @@ public sealed class AgentKnowledgeService
     private AgentRecord? Resolve(Guid id, string profile)
     {
         if (profile is not ("local" or "external")) return null;
-        var revision = store.PolicyRevision;
         var record = store.ListRecords().SingleOrDefault(x => x.Metadata.Id == id);
         if (record is null) return null;
+        return Resolve(record, profile);
+    }
+
+    private AgentRecord? Resolve(KnowledgeRecordView record, string profile)
+    {
+        if (profile is not ("local" or "external")) return null;
+        var revision = store.PolicyRevision;
         if (profile == "external" && (record.Metadata.Status != "reviewed" || record.StaleReason is not null || store.EffectiveAccess(record.Metadata) != "external_allowed")) return null;
         if (profile == "external" && record.Metadata.SourceRefs.Length == 0) return null;
         var citations = new List<AgentCitation>();

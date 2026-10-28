@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Text;
 using System.Net;
 using System.Net.Sockets;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 using Xunit;
 
 namespace KnowledgeBase.Tests;
@@ -540,6 +542,38 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void AgentSearchDoesNotCountUnavailableRecordsAgainstSessionCandidateLimit()
+    {
+        var privatePath = Path.Combine(temp, "private-cursor-source.txt"); File.WriteAllText(privatePath, "Private candidate evidence.");
+        var store = new KnowledgeBaseStore(Db); var privateSourceId = store.Import(privatePath).Items.Single().SourceId!.Value;
+        var templateDraft = store.DraftCandidate(privateSourceId, "Sessionlimit private template", "Sessionlimit searchable body.", 1, 1, "Private candidate evidence.");
+        var template = store.AcceptRecord(templateDraft.Metadata.Id, new[] { privateSourceId });
+        var serializer = new SerializerBuilder().WithNamingConvention(UnderscoredNamingConvention.Instance).Build();
+        for (var index = 0; index < 1000; index++)
+        {
+            var metadata = template.Metadata with { Id = Guid.NewGuid(), Title = $"Sessionlimit private {index:D4}" };
+            metadata = metadata with { ReviewedContentSha256 = KnowledgeRepository.ContentHash(metadata, template.Body) };
+            var yaml = serializer.Serialize(KnowledgeRecordYaml.From(metadata)).TrimEnd();
+            var markdown = $"---\n{yaml}\n---\n{template.Body.TrimEnd()}\n";
+            File.WriteAllText(Path.Combine(Db, "knowledge", "reviewed", metadata.Id + ".md"), markdown, new UTF8Encoding(false));
+        }
+
+        var publicSourceId = CreateExternalSource(store, "Public candidate evidence.");
+        var allowedIds = new List<Guid>();
+        foreach (var title in new[] { "Sessionlimit public one", "Sessionlimit public two" })
+        {
+            var draft = store.DraftCandidate(publicSourceId, title, "Sessionlimit searchable body.", 1, 1, "Public candidate evidence.");
+            allowedIds.Add(store.AcceptRecord(draft.Metadata.Id, new[] { publicSourceId }).Metadata.Id);
+        }
+
+        var service = new AgentKnowledgeService(store, new byte[32]);
+        var page = service.Search("sessionlimit", 10, null, "external", "external-client", new[] { "search" });
+
+        Assert.Equal(allowedIds.Order(), page.Results.Select(x => x.Id).Order());
+        Assert.Null(page.Cursor);
+    }
+
+    [Fact]
     public async Task GatewayHttpDraftReplaySurvivesServerRestartForDraftOnlyClient()
     {
         var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP draft evidence.");
@@ -567,7 +601,10 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var issued = new ClientRegistry(Path.Combine(temp, "clients.json")).Create("external", new[] { "search" });
         using var server = StartGateway(store, Path.Combine(temp, "state"), Path.Combine(temp, "clients.json"));
         using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/search"); request.Headers.Authorization = new("Bearer", issued.Token);
-        request.Content = new UnknownLengthContent(new byte[1024 * 1024 + 32]);
+        var payload = JsonSerializer.Serialize(new { query = new string('x', 1024 * 1024), limit = 1 });
+        request.Content = new UnknownLengthContent(Encoding.UTF8.GetBytes(payload), 4096);
+        request.Content.Headers.ContentType = new("application/json");
+        Assert.Null(request.Content.Headers.ContentLength);
         using var response = await server.Client.SendAsync(request);
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         using var error = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -788,9 +825,19 @@ public sealed class ImportAndRecoveryTests : IDisposable
         }
     }
 
-    private sealed class UnknownLengthContent(byte[] content) : HttpContent
+    private sealed class UnknownLengthContent(byte[] content, int chunkSize) : HttpContent
     {
-        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(content).AsTask();
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => WriteChunksAsync(stream, CancellationToken.None);
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken) => WriteChunksAsync(stream, cancellationToken);
+        private async Task WriteChunksAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            for (var offset = 0; offset < content.Length; offset += chunkSize)
+            {
+                var count = Math.Min(chunkSize, content.Length - offset);
+                await stream.WriteAsync(content.AsMemory(offset, count), cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+            }
+        }
         protected override bool TryComputeLength(out long length) { length = 0; return false; }
     }
 
