@@ -1,6 +1,6 @@
 using System.Text;
 using System.Security.Cryptography;
-using System.Collections.Concurrent;
+using System.Text.Json;
 
 namespace KnowledgeBase.Core;
 
@@ -11,8 +11,15 @@ public sealed record AgentSearchPage(AgentRecord[] Results, string? Cursor, long
 public sealed class AgentKnowledgeService
 {
     private readonly KnowledgeBaseStore store;
-    private readonly ConcurrentDictionary<string, SearchSession> sessions = new(StringComparer.Ordinal);
-    private sealed record SearchSession(AgentRecord[] Results, string ClientId, string Profile, string ScopeDigest, string QueryDigest, long Revision, DateTimeOffset ExpiresAt);
+    private const int MaxSessions = 128;
+    private const int MaxCandidatesPerSession = 1000;
+    private const int MaxSessionBytes = 32 * 1024 * 1024;
+    private readonly object sessionsGate = new();
+    private readonly Dictionary<string, SearchSession> sessions = new(StringComparer.Ordinal);
+    private int sessionBytes;
+    private sealed record SourceDependency(Guid SourceId, string TextSha256, int StartLine, int EndLine);
+    private sealed record SearchCandidate(Guid Id, string Version, string Status, SourceDependency[] Dependencies);
+    private sealed record SearchSession(SearchCandidate[] Candidates, string ClientId, string Profile, string ScopeDigest, string QueryDigest, long Revision, DateTimeOffset ExpiresAt, int EstimatedBytes, int NextOffset = 0);
     public AgentKnowledgeService(KnowledgeBaseStore store, byte[] cursorKey) { this.store = store; }
 
     public AgentSearchPage Search(string query, int limit, string? cursor, string profile)
@@ -24,41 +31,73 @@ public sealed class AgentKnowledgeService
         if (profile is not ("local" or "external")) throw new ArgumentException("Invalid profile");
         limit = Math.Clamp(limit, 1, 50);
         var now = DateTimeOffset.UtcNow;
-        foreach (var expired in sessions.Where(x => x.Value.ExpiresAt <= now).Select(x => x.Key).ToArray()) { sessions.TryRemove(expired, out _); cursorPositions.TryRemove(expired, out _); }
+        lock (sessionsGate) RemoveExpired(now);
         var queryDigest = Hash(query + "\n" + limit); var scopeDigest = Hash(string.Join("\n", scopes.Order(StringComparer.Ordinal)));
-        SearchSession session; var offset = 0;
+        SearchSession session; var offset = 0; string? consumedCursor = null;
         if (cursor is null)
         {
-            var candidates = store.ListRecords().Where(x => termsMatch(x, query)).OrderBy(x => x.Metadata.Id).ToArray();
-            var resolved = new List<AgentRecord>();
-            foreach (var candidate in candidates)
+            var records = store.ListRecords().Where(x => termsMatch(x, query)).OrderBy(x => x.Metadata.Id).Take(MaxCandidatesPerSession + 1).ToArray();
+            if (records.Length > MaxCandidatesPerSession) throw new IOException("search_session_limit");
+            var resolved = new List<SearchCandidate>(records.Length);
+            foreach (var candidate in records)
             {
-                try { var item = Resolve(candidate.Metadata.Id, profile); if (item is not null) resolved.Add(item); }
+                try
+                {
+                    var item = Resolve(candidate.Metadata.Id, profile);
+                    if (item is not null) resolved.Add(new(item.Id, item.Version, item.Status, item.Citations.Select(c => new SourceDependency(c.SourceId, c.TextSha256, c.StartLine, c.EndLine)).ToArray()));
+                }
                 catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException) { }
             }
-            if (sessions.Count >= 500) throw new IOException("search_session_limit");
-            session = new(resolved.ToArray(), clientId, profile, scopeDigest, queryDigest, store.PolicyRevision, now.AddMinutes(10));
+            var encoded = JsonSerializer.SerializeToUtf8Bytes(resolved).Length + Encoding.UTF8.GetByteCount(clientId + profile + scopeDigest + queryDigest);
+            if (encoded > MaxSessionBytes) throw new IOException("search_session_limit");
+            session = new(resolved.ToArray(), clientId, profile, scopeDigest, queryDigest, store.PolicyRevision, now.AddMinutes(10), encoded);
         }
         else
         {
-            if (!sessions.TryGetValue(cursor, out var found)) throw new ArgumentException("Invalid cursor");
-            session = found;
-            if (session.ExpiresAt <= now || session.ClientId != clientId || session.Profile != profile || session.ScopeDigest != scopeDigest || session.QueryDigest != queryDigest) throw new ArgumentException("Invalid cursor");
-            if (session.Revision != store.PolicyRevision) throw new IOException("policy_changed");
-            if (!cursorPositions.TryGetValue(cursor, out offset) || !sessions.TryRemove(cursor, out _)) throw new ArgumentException("Invalid cursor");
-            cursorPositions.TryRemove(cursor, out _);
+            lock (sessionsGate)
+            {
+                RemoveExpired(now);
+                if (!sessions.TryGetValue(cursor, out session!)) throw new ArgumentException("Invalid cursor");
+                if (session.ClientId != clientId || session.Profile != profile || session.ScopeDigest != scopeDigest || session.QueryDigest != queryDigest) throw new ArgumentException("Invalid cursor");
+                if (session.Revision != store.PolicyRevision) { RemoveSession(cursor); throw new IOException("policy_changed"); }
+                offset = session.NextOffset; consumedCursor = cursor; RemoveSession(cursor);
+            }
         }
-        var page = session.Results.Skip(offset).Take(limit).ToArray(); var nextOffset = offset + page.Length;
+        var pageCandidates = session.Candidates.Skip(offset).Take(limit).ToArray();
+        var page = new List<AgentRecord>(pageCandidates.Length);
+        foreach (var expected in pageCandidates)
+        {
+            AgentRecord? current;
+            try { current = Resolve(expected.Id, profile); }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException) { current = null; }
+            var dependencies = current?.Citations.Select(c => new SourceDependency(c.SourceId, c.TextSha256, c.StartLine, c.EndLine)).ToArray();
+            if (current is null || current.Version != expected.Version || current.Status != expected.Status || !expected.Dependencies.SequenceEqual(dependencies))
+                throw new IOException("policy_changed");
+            page.Add(current);
+        }
+        var nextOffset = offset + pageCandidates.Length;
         string? next = null;
-        if (nextOffset < session.Results.Length)
+        if (nextOffset < session.Candidates.Length)
         {
             next = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-            if (!sessions.TryAdd(next, session) || !cursorPositions.TryAdd(next, nextOffset)) throw new IOException("search_session_limit");
+            lock (sessionsGate)
+            {
+                RemoveExpired(DateTimeOffset.UtcNow);
+                if ((consumedCursor is null && sessions.Count >= MaxSessions) || sessionBytes + session.EstimatedBytes > MaxSessionBytes) throw new IOException("search_session_limit");
+                sessions[next] = session with { NextOffset = nextOffset }; sessionBytes += session.EstimatedBytes;
+            }
         }
-        return new(page, next, session.Revision);
+        return new(page.ToArray(), next, session.Revision);
     }
 
-    private readonly ConcurrentDictionary<string, int> cursorPositions = new(StringComparer.Ordinal);
+    private void RemoveExpired(DateTimeOffset now)
+    {
+        foreach (var token in sessions.Where(x => x.Value.ExpiresAt <= now).Select(x => x.Key).ToArray()) RemoveSession(token);
+    }
+    private void RemoveSession(string token)
+    {
+        if (sessions.Remove(token, out var removed)) sessionBytes -= removed.EstimatedBytes;
+    }
     private static bool termsMatch(KnowledgeRecordView x, string query) => query.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).All(term => (x.Metadata.Title + "\n" + x.Body).Contains(term, StringComparison.OrdinalIgnoreCase));
 
     public AgentRecord GetRecord(Guid id, string profile) => Resolve(id, profile) ?? throw new FileNotFoundException("resource_unavailable");

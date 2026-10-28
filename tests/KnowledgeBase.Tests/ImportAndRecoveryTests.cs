@@ -3,6 +3,8 @@ using Microsoft.Data.Sqlite;
 using System.Text.Json;
 using System.Diagnostics;
 using System.Text;
+using System.Net;
+using System.Net.Sockets;
 using Xunit;
 
 namespace KnowledgeBase.Tests;
@@ -457,6 +459,21 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task CliCreateAndRevokeInSeparateProcessesPreserveBothRegistryChanges()
+    {
+        var path = Path.Combine(temp, "process-clients.json"); var registry = new ClientRegistry(path);
+        var existing = registry.Create("local", new[] { "read" });
+        var environment = new Dictionary<string, string> { ["KB_CLIENT_REGISTRY_PATH"] = path };
+        var create = Task.Run(() => RunCliWithEnvironment(environment, "--json", "client", "create", "--profile", "external", "--scopes", "search"));
+        var revoke = Task.Run(() => RunCliWithEnvironment(environment, "--json", "client", "revoke", existing.ClientId));
+        var results = await Task.WhenAll(create, revoke);
+        Assert.All(results, result => Assert.Equal(0, result.ExitCode));
+        using var created = JsonDocument.Parse(results[0].Stdout); var token = created.RootElement.GetProperty("token").GetString()!;
+        Assert.Null(registry.Authenticate(existing.Token));
+        Assert.NotNull(registry.Authenticate(token));
+    }
+
+    [Fact]
     public void IdempotencyStorePersistsStableReceiptAndRejectsDigestConflict()
     {
         var state = Path.Combine(temp, "gateway-state"); var first = new IdempotencyStore(state);
@@ -490,6 +507,161 @@ public sealed class ImportAndRecoveryTests : IDisposable
         Assert.Throws<ArgumentException>(() => service.Search("cursorword", 1, first.Cursor, "external", "client-two", new[] { "search" }));
         store.SetSourceAccess(sourceId, "local_only", "Revoke cursor visibility");
         Assert.Throws<IOException>(() => service.Search("cursorword", 1, first.Cursor, "external", "client-one", new[] { "search" }));
+    }
+
+    [Theory]
+    [InlineData("edit")]
+    [InlineData("archive")]
+    [InlineData("source")]
+    public void AgentSearchCursorRejectsChangedRecordsAndDependencies(string change)
+    {
+        var input = Path.Combine(temp, "cursor-recheck-source.txt"); File.WriteAllText(input, "Cursor recheck evidence.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var ids = new List<Guid>();
+        foreach (var title in new[] { "Cursor recheck one", "Cursor recheck two" })
+        {
+            var draft = store.DraftCandidate(sourceId, title, "Cursorrecheck body.", 1, 1, "Cursor recheck evidence.");
+            ids.Add(store.AcceptRecord(draft.Metadata.Id, new[] { sourceId }).Metadata.Id);
+        }
+        store.SetSourceAccess(sourceId, "external_allowed", "Allowed for cursor recheck test");
+        var service = new AgentKnowledgeService(store, new byte[32]);
+        var first = service.Search("cursorrecheck", 1, null, "external", "client-one", new[] { "search" });
+        var changedId = ids.Single(id => id != first.Results[0].Id);
+        switch (change)
+        {
+            case "edit":
+                var edited = store.ShowRecord(changedId);
+                store.EditRecord(changedId, File.ReadAllText(edited.Path).Replace("Cursorrecheck body.", "Changed cursorrecheck body.", StringComparison.Ordinal));
+                break;
+            case "archive": store.RejectRecord(changedId, "Archived between pages"); break;
+            case "source": File.WriteAllText(Path.Combine(store.Show(sourceId).Directory, "extracted.txt"), "Changed source evidence."); break;
+        }
+        Assert.Throws<IOException>(() => service.Search("cursorrecheck", 1, first.Cursor, "external", "client-one", new[] { "search" }));
+    }
+
+    [Fact]
+    public async Task GatewayHttpDraftReplaySurvivesServerRestartForDraftOnlyClient()
+    {
+        var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP draft evidence.");
+        var issued = new ClientRegistry(Path.Combine(temp, "clients.json")).Create("external", new[] { "draft" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), Path.Combine(temp, "clients.json"));
+        var first = await PostDraft(server.Client, issued.Token, sourceId, "http-draft-key");
+        Assert.True(first.StatusCode == HttpStatusCode.Created, $"Draft request failed: {(int)first.StatusCode} {await first.Content.ReadAsStringAsync()}");
+        var firstJson = JsonDocument.Parse(await first.Content.ReadAsStringAsync()); var recordId = firstJson.RootElement.GetProperty("id").GetGuid();
+        var replay = await PostDraft(server.Client, issued.Token, sourceId, "http-draft-key");
+        Assert.Equal(HttpStatusCode.Created, replay.StatusCode); Assert.Equal("true", replay.Headers.GetValues("Idempotency-Replayed").Single());
+        server.Restart();
+        var afterRestart = await PostDraft(server.Client, issued.Token, sourceId, "http-draft-key");
+        Assert.Equal(HttpStatusCode.Created, afterRestart.StatusCode); Assert.Equal("true", afterRestart.Headers.GetValues("Idempotency-Replayed").Single());
+        using var recoveredJson = JsonDocument.Parse(await afterRestart.Content.ReadAsStringAsync());
+        Assert.Equal(recordId, recoveredJson.RootElement.GetProperty("id").GetGuid());
+        Assert.Single(store.ListRecords(), x => x.Metadata.Id == recordId);
+        using var get = new HttpRequestMessage(HttpMethod.Get, $"/v1/records/{recordId}"); get.Headers.Authorization = new("Bearer", issued.Token);
+        Assert.Equal(HttpStatusCode.Forbidden, (await server.Client.SendAsync(get)).StatusCode);
+    }
+
+    [Fact]
+    public async Task GatewayHttpReturnsJson413ForChunkedBodyWithoutContentLength()
+    {
+        var store = new KnowledgeBaseStore(Db); _ = CreateExternalSource(store, "HTTP size evidence.");
+        var issued = new ClientRegistry(Path.Combine(temp, "clients.json")).Create("external", new[] { "search" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), Path.Combine(temp, "clients.json"));
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/search"); request.Headers.Authorization = new("Bearer", issued.Token);
+        request.Content = new UnknownLengthContent(new byte[1024 * 1024 + 32]);
+        using var response = await server.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+        using var error = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("request_too_large", error.RootElement.GetProperty("error").GetString());
+        Assert.True(error.RootElement.TryGetProperty("request_id", out _));
+    }
+
+    [Theory]
+    [InlineData("edit")]
+    [InlineData("archive")]
+    public async Task GatewayHttpCursorRejectsRecordChangedBetweenPages(string change)
+    {
+        var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP cursor evidence.");
+        var recordIds = new List<Guid>();
+        foreach (var title in new[] { "HTTP cursor one", "HTTP cursor two" })
+        {
+            var draft = store.DraftCandidate(sourceId, title, "Httpcursor searchable body.", 1, 1, "HTTP cursor evidence.");
+            recordIds.Add(store.AcceptRecord(draft.Metadata.Id, new[] { sourceId }).Metadata.Id);
+        }
+        var registryPath = Path.Combine(temp, "clients.json"); var issued = new ClientRegistry(registryPath).Create("external", new[] { "search" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), registryPath);
+        var first = await Search(server.Client, issued.Token, "httpcursor", null); Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        using var firstJson = JsonDocument.Parse(await first.Content.ReadAsStringAsync()); var cursor = firstJson.RootElement.GetProperty("cursor").GetString(); Assert.NotNull(cursor);
+        var remaining = recordIds.Single(id => id != firstJson.RootElement.GetProperty("results")[0].GetProperty("id").GetGuid());
+        if (change == "archive") store.RejectRecord(remaining, "Archived between HTTP cursor pages");
+        else
+        {
+            var edited = store.ShowRecord(remaining);
+            store.EditRecord(remaining, File.ReadAllText(edited.Path).Replace("Httpcursor searchable body.", "Edited httpcursor body.", StringComparison.Ordinal));
+        }
+        var second = await Search(server.Client, issued.Token, "httpcursor", cursor);
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+        using var error = JsonDocument.Parse(await second.Content.ReadAsStringAsync()); Assert.Equal("retry_required", error.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task GatewayHttpRecoversSavedDraftAfterAuditFailureAndRestart()
+    {
+        var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP draft evidence.");
+        var registryPath = Path.Combine(temp, "clients.json"); var issued = new ClientRegistry(registryPath).Create("external", new[] { "draft" });
+        var state = Path.Combine(temp, "state"); Directory.CreateDirectory(Path.Combine(state, "agent-audit.jsonl"));
+        using var server = StartGateway(store, state, registryPath);
+        var failed = await PostDraft(server.Client, issued.Token, sourceId, "audit-recovery-key");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, failed.StatusCode);
+        var savedId = Assert.Single(store.ListRecords(), x => x.Metadata.Status == "draft").Metadata.Id;
+        server.Restart(); Directory.Delete(Path.Combine(state, "agent-audit.jsonl"));
+        var replay = await PostDraft(server.Client, issued.Token, sourceId, "audit-recovery-key");
+        Assert.Equal(HttpStatusCode.Created, replay.StatusCode); Assert.Equal("true", replay.Headers.GetValues("Idempotency-Replayed").Single());
+        using var receipt = JsonDocument.Parse(await replay.Content.ReadAsStringAsync()); Assert.Equal(savedId, receipt.RootElement.GetProperty("id").GetGuid());
+        Assert.Single(store.ListRecords(), x => x.Metadata.Id == savedId);
+    }
+
+    [Fact]
+    public async Task GatewayHttpRechecksRevocationAndClassificationAfterSlowBody()
+    {
+        var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP draft evidence.");
+        var registryPath = Path.Combine(temp, "clients.json"); var registry = new ClientRegistry(registryPath);
+        var searchClient = registry.Create("external", new[] { "search" }); var draftClient = registry.Create("external", new[] { "draft" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), registryPath);
+
+        var searchContent = new GatedContent("{\"query\":\"slow query\",", "\"limit\":1}");
+        using var searchRequest = new HttpRequestMessage(HttpMethod.Post, "/v1/search") { Content = searchContent };
+        searchRequest.Headers.Authorization = new("Bearer", searchClient.Token);
+        var searchTask = server.Client.SendAsync(searchRequest);
+        await searchContent.PrefixSent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(registry.Revoke(searchClient.ClientId)); searchContent.ReleaseBody();
+        using var revoked = await searchTask; Assert.Equal(HttpStatusCode.Unauthorized, revoked.StatusCode);
+
+        var payload = JsonSerializer.Serialize(new { title = "HTTP draft", body = "A draft created over HTTP.", citations = new[] { new { source_id = sourceId, start_line = 1, end_line = 1, quote = "HTTP draft evidence." } } });
+        var split = payload.Length / 2; var draftContent = new GatedContent(payload[..split], payload[split..]);
+        using var draftRequest = new HttpRequestMessage(HttpMethod.Post, "/v1/drafts") { Content = draftContent };
+        draftRequest.Headers.Authorization = new("Bearer", draftClient.Token); draftRequest.Headers.Add("Idempotency-Key", "classification-race");
+        var draftTask = server.Client.SendAsync(draftRequest);
+        await draftContent.PrefixSent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        store.SetSourceAccess(sourceId, "local_only", "Restricted during HTTP body upload"); draftContent.ReleaseBody();
+        using var hidden = await draftTask; Assert.Equal(HttpStatusCode.NotFound, hidden.StatusCode);
+        Assert.DoesNotContain(store.ListRecords(), x => x.Metadata.Title == "HTTP draft");
+    }
+
+    [Fact]
+    public async Task GatewayHttpCancellationDuringBodyDoesNotSaveDraftOrHoldDatabaseLock()
+    {
+        var store = new KnowledgeBaseStore(Db); var sourceId = CreateExternalSource(store, "HTTP draft evidence.");
+        var registryPath = Path.Combine(temp, "clients.json"); var issued = new ClientRegistry(registryPath).Create("external", new[] { "draft" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), registryPath);
+        var payload = JsonSerializer.Serialize(new { title = "Cancelled HTTP draft", body = "Must not persist.", citations = new[] { new { source_id = sourceId, start_line = 1, end_line = 1, quote = "HTTP draft evidence." } } });
+        var split = payload.Length / 2; var content = new GatedContent(payload[..split], payload[split..]);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/drafts") { Content = content };
+        request.Headers.Authorization = new("Bearer", issued.Token); request.Headers.Add("Idempotency-Key", "cancelled-key");
+        using var cancellation = new CancellationTokenSource(); var responseTask = server.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation.Token);
+        await content.PrefixSent.Task.WaitAsync(TimeSpan.FromSeconds(5)); cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => responseTask);
+        store.SetSourceAccess(sourceId, "local_only", "Verify cancelled request released the database");
+        Assert.DoesNotContain(store.ListRecords(), x => x.Metadata.Title == "Cancelled HTTP draft");
     }
 
     [Fact]
@@ -535,6 +707,109 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var summary = new KnowledgeBaseStore(Db).Import(input);
         Assert.Equal(1, summary.SkippedSymlinks);
         Assert.Empty(summary.Items);
+    }
+
+    private Guid CreateExternalSource(KnowledgeBaseStore store, string content)
+    {
+        var path = Path.Combine(temp, Guid.NewGuid().ToString("N") + ".txt"); File.WriteAllText(path, content);
+        var id = store.Import(path).Items.Single().SourceId!.Value; store.SetSourceAccess(id, "external_allowed", "HTTP integration fixture"); return id;
+    }
+
+    private static async Task<HttpResponseMessage> PostDraft(HttpClient client, string token, Guid sourceId, string key)
+    {
+        var payload = JsonSerializer.Serialize(new { title = "HTTP draft", body = "A draft created over HTTP.", citations = new[] { new { source_id = sourceId, start_line = 1, end_line = 1, quote = "HTTP draft evidence." } } });
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/drafts") { Content = new StringContent(payload, Encoding.UTF8, "application/json") };
+        request.Headers.Authorization = new("Bearer", token); request.Headers.Add("Idempotency-Key", key); return await client.SendAsync(request);
+    }
+
+    private static async Task<HttpResponseMessage> Search(HttpClient client, string token, string query, string? cursor)
+    {
+        var payload = JsonSerializer.Serialize(new { query, limit = 1, cursor });
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/search") { Content = new StringContent(payload, Encoding.UTF8, "application/json") };
+        request.Headers.Authorization = new("Bearer", token); return await client.SendAsync(request);
+    }
+
+    private GatewayProcess StartGateway(KnowledgeBaseStore store, string statePath, string registryPath)
+    {
+        store.Migrate(2); store.Migrate(3);
+        return new GatewayProcess(Db, statePath, registryPath);
+    }
+
+    private sealed class GatewayProcess : IDisposable
+    {
+        private readonly string database; private readonly string state; private readonly string registry; private readonly int port;
+        private Process process = null!;
+        public HttpClient Client { get; }
+        public GatewayProcess(string database, string state, string registry)
+        {
+            this.database = database; this.state = state; this.registry = registry; port = ReservePort();
+            Client = new HttpClient(new HttpClientHandler { UseProxy = false }) { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
+            Start();
+        }
+        public void Restart() { Stop(); Start(); }
+        private void Start()
+        {
+            var root = FindRepositoryRoot(); var output = new DirectoryInfo(AppContext.BaseDirectory); var configuration = output.Parent!.Name;
+            var serverDll = Path.Combine(root, "src", "KnowledgeBase.Server", "bin", configuration, output.Name, "KnowledgeBase.Server.dll");
+            if (!File.Exists(serverDll)) throw new FileNotFoundException("Gateway server build output was not found", serverDll);
+            var start = new ProcessStartInfo("dotnet") { UseShellExecute = false, RedirectStandardError = true };
+            start.ArgumentList.Add(serverDll); start.Environment["KB_DATABASE_PATH"] = database; start.Environment["KB_SERVER_STATE_PATH"] = state;
+            start.Environment["KB_CLIENT_REGISTRY_PATH"] = registry; start.Environment["KB_SERVER_PORT"] = port.ToString();
+            process = Process.Start(start) ?? throw new InvalidOperationException("Could not start gateway process");
+            var stderr = process.StandardError.ReadToEndAsync();
+            for (var i = 0; i < 100; i++)
+            {
+                if (process.HasExited) throw new InvalidOperationException($"Gateway exited during startup: {stderr.GetAwaiter().GetResult()}");
+                try
+                {
+                    using var response = Client.PostAsync("/v1/search", new StringContent("{}", Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+                    if (response.StatusCode == HttpStatusCode.Unauthorized) return;
+                }
+                catch (HttpRequestException) { }
+                Thread.Sleep(50);
+            }
+            throw new TimeoutException("Gateway did not start listening");
+        }
+        private void Stop()
+        {
+            if (process is null || process.HasExited) return;
+            process.Kill(true); process.WaitForExit(5000); process.Dispose();
+        }
+        public void Dispose() { Stop(); Client.Dispose(); }
+        private static int ReservePort()
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0); listener.Start(); return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        private static string FindRepositoryRoot()
+        {
+            for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+                if (File.Exists(Path.Combine(directory.FullName, "KnowledgeBase.slnx"))) return directory.FullName;
+            throw new DirectoryNotFoundException("Could not locate repository root from test output directory");
+        }
+    }
+
+    private sealed class UnknownLengthContent(byte[] content) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(content).AsTask();
+        protected override bool TryComputeLength(out long length) { length = 0; return false; }
+    }
+
+    private sealed class GatedContent(string first, string second) : HttpContent
+    {
+        public TaskCompletionSource PrefixSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void ReleaseBody() => release.TrySetResult();
+        protected override async Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context)
+        {
+            await WriteAsync(stream, CancellationToken.None);
+        }
+        protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context, CancellationToken cancellationToken) => WriteAsync(stream, cancellationToken);
+        private async Task WriteAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            var prefix = Encoding.UTF8.GetBytes(first); await stream.WriteAsync(prefix, cancellationToken); await stream.FlushAsync(cancellationToken); PrefixSent.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken); var suffix = Encoding.UTF8.GetBytes(second); await stream.WriteAsync(suffix, cancellationToken);
+        }
+        protected override bool TryComputeLength(out long length) { length = 0; return false; }
     }
 
     private (int ExitCode, string Stdout, string Stderr) RunCli(params string[] arguments)

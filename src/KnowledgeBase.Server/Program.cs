@@ -201,6 +201,7 @@ async Task<IResult> HandleFailure(HttpContext context, Exception ex, ClientCrede
     var (status, error) = ex switch
     {
         FileNotFoundException => (404, "resource_unavailable"),
+        BadHttpRequestException badRequest when badRequest.StatusCode == StatusCodes.Status413PayloadTooLarge => (413, "request_too_large"),
         ArgumentException or JsonException => (400, "invalid_request"),
         InvalidOperationException when ex.Message == "idempotency_conflict" => (409, "idempotency_conflict"),
         InvalidOperationException => (503, "service_unavailable"),
@@ -221,7 +222,7 @@ async Task WriteError(HttpContext context, int status, string error)
 async Task<T?> ReadJson<T>(HttpContext context)
 {
     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted); timeout.CancelAfter(TimeSpan.FromSeconds(10));
-    try { return await JsonSerializer.DeserializeAsync<T>(context.Request.Body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true, MaxDepth = 32, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow }, timeout.Token); }
+    try { return await JsonSerializer.DeserializeAsync<T>(context.Request.Body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, MaxDepth = 32, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow }, timeout.Token); }
     catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested) { throw new ArgumentException("request_timeout"); }
 }
 string[] ValidateDraftSources(DraftRequest request, string profile)
