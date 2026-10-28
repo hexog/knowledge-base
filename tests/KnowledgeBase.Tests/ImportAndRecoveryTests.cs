@@ -381,6 +381,49 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void MigrationStopsAndPreservesJournalWhenStagedFileHashIsWrong()
+    {
+        var store = new KnowledgeBaseStore(Db); store.Initialize();
+        var settingsPath = Path.Combine(Db, "config", "settings.json"); var stagedPath = settingsPath + ".v2.new";
+        var original = File.ReadAllText(settingsPath); var expected = "{\"schema_version\":\"2\",\"max_file_size_bytes\":52428800,\"max_extracted_text_bytes\":10485760}\n";
+        File.WriteAllText(stagedPath, "tampered staged data");
+        static string Hash(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+        var journal = new { format_version = 1, phase = "committing", completed = 0, changes = new[] { new { target = "config/settings.json", staged = "config/settings.json.v2.new", sha256 = Hash(expected), originalSha256 = Hash(original), kind = "settings" } } };
+        var journalPath = Path.Combine(Db, ".migration-v2.json"); File.WriteAllText(journalPath, JsonSerializer.Serialize(journal));
+        Assert.Throws<InvalidDataException>(() => store.Migrate(2));
+        Assert.True(File.Exists(journalPath)); Assert.True(File.Exists(stagedPath)); Assert.Equal(original, File.ReadAllText(settingsPath));
+    }
+
+    [Fact]
+    public void ExternalAgentAccessTracksCurrentSourceClassification()
+    {
+        var input = Path.Combine(temp, "policy.txt"); File.WriteAllText(input, "A cited policy line.\nMore context.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        var text = File.ReadAllText(Path.Combine(store.Show(sourceId).Directory, "extracted.txt"));
+        var draft = store.DraftCandidate(sourceId, "Policy claim", "Claim body", 1, 1, "A cited policy line.");
+        store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        var service = new AgentKnowledgeService(store, new byte[32]);
+        Assert.Throws<FileNotFoundException>(() => service.GetRecord(draft.Metadata.Id, "external"));
+        var revision = store.SetSourceAccess(sourceId, "external_allowed", "Reviewed for external use");
+        var exposed = service.GetRecord(draft.Metadata.Id, "external");
+        Assert.Equal("reviewed", exposed.Status); Assert.Equal(revision, exposed.PolicyRevision);
+        var nextRevision = store.SetSourceAccess(sourceId, "local_only", "Owner restricted this source");
+        Assert.True(nextRevision > revision);
+        Assert.Throws<FileNotFoundException>(() => service.GetRecord(draft.Metadata.Id, "external"));
+    }
+
+    [Fact]
+    public void ClientRegistryStoresOnlyTokenHashAndRevocationTakesEffect()
+    {
+        var path = Path.Combine(temp, "clients.json"); var registry = new ClientRegistry(path);
+        var issued = registry.Create("external", new[] { "search", "read" });
+        Assert.DoesNotContain(issued.Token, File.ReadAllText(path));
+        Assert.Equal(issued.ClientId, registry.Authenticate(issued.Token)?.ClientId);
+        Assert.True(registry.Revoke(issued.ClientId));
+        Assert.Null(registry.Authenticate(issued.Token));
+    }
+
+    [Fact]
     public void LocalExtractorKeepsValidPartialResultsAndRejectsMalformedOrOversizedProcessOutput()
     {
         var input = Path.Combine(temp, "extractor-source.txt"); File.WriteAllText(input, "Extractor evidence line.\nSecond line.");
@@ -400,6 +443,18 @@ public sealed class ImportAndRecoveryTests : IDisposable
             Assert.NotEqual(0, failed.ExitCode);
             Assert.Single(store.ListRecords());
         }
+    }
+
+    [Fact]
+    public async Task ExtractorRunnerKillsAProcessThatDoesNotReadInputWhenTimedOut()
+    {
+        var output = new DirectoryInfo(AppContext.BaseDirectory); var targetFramework = output.Name; var configuration = output.Parent!.Name;
+        var child = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, $"../../../../ExtractorTestProcess/bin/{configuration}/{targetFramework}/ExtractorTestProcess.dll"));
+        Assert.True(File.Exists(child), $"Expected test extractor at {child}");
+        var start = new System.Diagnostics.ProcessStartInfo("dotnet"); start.ArgumentList.Add(child); start.ArgumentList.Add("no_read_wait");
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<TimeoutException>(() => ExtractorProcessRunner.RunAsync(start, "input", TimeSpan.FromMilliseconds(300)));
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(5));
     }
 
     [Fact]

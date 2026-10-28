@@ -71,6 +71,47 @@ var migrateVersion = new Option<int>("--to") { Required = true, Description = "T
 var migrate = new Command("migrate", "Migrate the knowledge base"); migrate.Options.Add(migrateVersion);
 migrate.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Migrate(parse.GetValue(migrateVersion)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
+var access = new Command("access", "Manage source and record access classifications");
+var accessSource = new Option<Guid?>("--source"); var accessRecord = new Option<Guid?>("--record");
+var accessShow = new Command("show", "Show current and effective access"); accessShow.Options.Add(accessSource); accessShow.Options.Add(accessRecord);
+accessShow.SetAction(parse => Run<object>(() =>
+{
+    var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!); var source = parse.GetValue(accessSource); var record = parse.GetValue(accessRecord);
+    if ((source is null) == (record is null)) throw new ArgumentException("Specify exactly one of --source or --record");
+    if (source is Guid sourceId) { var value = store.Show(sourceId).Record; return new { source_id = sourceId, access = value.Access, policy_revision = store.PolicyRevision }; }
+    var view = store.ShowRecord(record!.Value); var effective = store.EffectiveAccess(view.Metadata);
+    return new { record_id = view.Metadata.Id, access_override = view.Metadata.AccessOverride, effective_access = effective, policy_revision = store.PolicyRevision };
+}, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var accessSet = new Command("set", "Set an owner classification override"); var accessLevel = new Option<string>("--level") { Required = true }; var accessReason = new Option<string>("--reason") { Required = true };
+accessSet.Options.Add(accessSource); accessSet.Options.Add(accessRecord); accessSet.Options.Add(accessLevel); accessSet.Options.Add(accessReason);
+accessSet.SetAction(parse => Run<object>(() =>
+{
+    var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!); var source = parse.GetValue(accessSource); var record = parse.GetValue(accessRecord);
+    if ((source is null) == (record is null)) throw new ArgumentException("Specify exactly one of --source or --record");
+    var level = parse.GetValue(accessLevel)!; if (level is not ("local_only" or "unclassified" or "external_allowed")) throw new ArgumentException("--level must be local_only, unclassified, or external_allowed");
+    var revision = source is Guid sourceId ? store.SetSourceAccess(sourceId, level, parse.GetValue(accessReason)!) : store.SetRecordAccessOverride(record!.Value, level, parse.GetValue(accessReason)!);
+    return new { policy_revision = revision, access = level };
+}, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var accessClear = new Command("clear", "Remove a record access override"); accessClear.Options.Add(accessRecord); accessClear.Options.Add(accessReason);
+accessClear.SetAction(parse => Run<object>(() => { var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!); var id = parse.GetValue(accessRecord) ?? throw new ArgumentException("--record is required"); return new { policy_revision = store.SetRecordAccessOverride(id, null, parse.GetValue(accessReason)!), access_override = (string?)null }; }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+access.Subcommands.Add(accessShow); access.Subcommands.Add(accessSet); access.Subcommands.Add(accessClear);
+
+var clients = new Command("client", "Manage agent API clients"); var profileOption = new Option<string>("--profile") { Required = true }; var scopesOption = new Option<string>("--scopes") { Required = true };
+var clientCreate = new Command("create", "Create a bearer credential (shown once)"); clientCreate.Options.Add(profileOption); clientCreate.Options.Add(scopesOption);
+clientCreate.SetAction(parse => Run<object>(() =>
+{
+    var path = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "clients.json");
+    var issued = new ClientRegistry(path).Create(parse.GetValue(profileOption)!, parse.GetValue(scopesOption)!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    return issued;
+}, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var clientRevoke = new Command("revoke", "Revoke an agent API client"); var clientId = new Argument<string>("client-id"); clientRevoke.Arguments.Add(clientId);
+clientRevoke.SetAction(parse => Run<object>(() =>
+{
+    var path = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "clients.json");
+    if (!new ClientRegistry(path).Revoke(parse.GetValue(clientId)!)) throw new FileNotFoundException("Client not found"); return new { revoked = true };
+}, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+clients.Subcommands.Add(clientCreate); clients.Subcommands.Add(clientRevoke);
+
 var recordsCommand = new Command("record", "Manage portable knowledge records");
 var draft = new Command("draft", "Create a knowledge draft from a source");
 var draftSource = new Option<Guid>("--source") { Required = true }; var draftTitle = new Option<string>("--title") { Required = true };
@@ -106,7 +147,7 @@ recordsCommand.Subcommands.Add(draft); recordsCommand.Subcommands.Add(listRecord
 var extract = new Command("extract", "Create draft suggestions with an explicitly configured local process"); var extractSource = new Option<Guid>("--source") { Required = true }; extract.Options.Add(extractSource);
 extract.SetAction(parse => Run(() => InvokeLocalExtractor(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(extractSource)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
-root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(extract);
+root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(extract);
 var parseResult = root.Parse(args);
 var jsonRequested = args.Contains("--json", StringComparer.Ordinal);
 if (parseResult.Errors.Count > 0)
@@ -212,45 +253,23 @@ static object InvokeLocalExtractor(KnowledgeBaseStore store, Guid sourceId)
     var actualTextHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
     if (record.ExtractedTextSha256 is null || !string.Equals(actualTextHash, record.ExtractedTextSha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Source {sourceId}: extracted text changed; reimport or repair the source before extraction");
     if (Encoding.UTF8.GetByteCount(text) > 10 * 1024 * 1024) throw new InvalidDataException("Local extractor input exceeds 10 MiB");
-    var start = new System.Diagnostics.ProcessStartInfo(executable) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+    var start = new System.Diagnostics.ProcessStartInfo(executable) { UseShellExecute = false };
     var configuredArgs = Environment.GetEnvironmentVariable("KB_LOCAL_EXTRACTOR_ARGUMENTS");
     if (!string.IsNullOrWhiteSpace(configuredArgs))
     {
         var args = JsonSerializer.Deserialize<string[]>(configuredArgs) ?? throw new InvalidDataException("KB_LOCAL_EXTRACTOR_ARGUMENTS must be a JSON array of strings");
         foreach (var arg in args) start.ArgumentList.Add(arg);
     }
-    using var process = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("Could not start local extractor");
     var request = new { schema_version = "1", operation_id = Guid.NewGuid(), source_id = sourceId, text_sha256 = record.ExtractedTextSha256, text };
     var modelVersion = Environment.GetEnvironmentVariable("KB_LOCAL_EXTRACTOR_MODEL_VERSION");
-    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(120));
     using var cancellation = new CancellationTokenSource();
-    using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellation.Token);
     ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => { eventArgs.Cancel = true; cancellation.Cancel(); };
     Console.CancelKeyPress += cancelHandler;
-    var outputTask = ReadBoundedAsync(process.StandardOutput.BaseStream, 4 * 1024 * 1024, linked.Token);
-    var errorTask = ReadBoundedAsync(process.StandardError.BaseStream, 64 * 1024, linked.Token);
-    var inputTask = WriteInputAsync(process, JsonSerializer.Serialize(request, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }), linked.Token);
-    var exitTask = process.WaitForExitAsync(linked.Token);
-    var pending = new List<Task> { inputTask, outputTask, errorTask, exitTask };
-    try
-    {
-        while (pending.Count > 0)
-        {
-            var finished = Task.WhenAny(pending).GetAwaiter().GetResult();
-            finished.GetAwaiter().GetResult();
-            pending.Remove(finished);
-        }
-    }
-    catch (Exception ex)
-    {
-        try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { }
-        try { Task.WhenAll(inputTask, outputTask, errorTask, process.WaitForExitAsync()).GetAwaiter().GetResult(); } catch { }
-        if (timeout.IsCancellationRequested) throw new TimeoutException("Local extractor exceeded the 120 second limit", ex);
-        throw;
-    }
+    ExtractorProcessResult processResult;
+    try { processResult = ExtractorProcessRunner.RunAsync(start, JsonSerializer.Serialize(request, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }), TimeSpan.FromSeconds(120), cancellation.Token).GetAwaiter().GetResult(); }
     finally { Console.CancelKeyPress -= cancelHandler; }
-    var output = outputTask.GetAwaiter().GetResult(); var stderr = errorTask.GetAwaiter().GetResult();
-    if (process.ExitCode != 0) throw new InvalidOperationException($"Local extractor exited with code {process.ExitCode}: {Encoding.UTF8.GetString(stderr)}");
+    var output = processResult.StandardOutput; var stderr = processResult.StandardError;
+    if (processResult.ExitCode != 0) throw new InvalidOperationException($"Local extractor exited with code {processResult.ExitCode}: {Encoding.UTF8.GetString(stderr)}");
     using var response = JsonDocument.Parse(output); var root = response.RootElement;
     if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Any(x => x.Name is not ("schema_version" or "candidates")) || !root.TryGetProperty("schema_version", out var version) || version.GetString() != "1" || !root.TryGetProperty("candidates", out var candidates) || candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 50)
         throw new InvalidDataException("Local extractor returned an invalid protocol response (expected schema_version 1 and up to 50 candidates)");
@@ -308,21 +327,6 @@ static string RequiredString(JsonElement element, string property)
     return value.GetString()!;
 }
 static string OptionalString(JsonElement element, string property, string fallback) => !element.TryGetProperty(property, out var value) ? fallback : value.ValueKind == JsonValueKind.String ? value.GetString()! : throw new InvalidDataException($"Candidate {property} must be a string");
-static async Task WriteInputAsync(System.Diagnostics.Process process, string request, CancellationToken token)
-{
-    await process.StandardInput.WriteAsync(request.AsMemory(), token); await process.StandardInput.FlushAsync(token); process.StandardInput.Close();
-}
-static async Task<byte[]> ReadBoundedAsync(Stream stream, int maxBytes, CancellationToken token)
-{
-    using var output = new MemoryStream(); var buffer = new byte[8192]; int read;
-    while ((read = await stream.ReadAsync(buffer, token)) > 0)
-    {
-        if (output.Length + read > maxBytes) throw new InvalidDataException($"Local extractor stream exceeds {maxBytes} bytes");
-        output.Write(buffer, 0, read);
-    }
-    return output.ToArray();
-}
-
 sealed class TemporaryEditFile : IDisposable
 {
     public string Path { get; }

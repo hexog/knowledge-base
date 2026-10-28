@@ -15,7 +15,8 @@ public sealed record KnowledgeRecord(string SchemaVersion, Guid Id, string Type,
     string Access, KnowledgeSourceRef[] SourceRefs, RecordTransition[] History, DateTimeOffset? ReviewedAt = null,
     KnowledgeSourceRef[]? ReviewedSources = null, string? RejectionReason = null, RelatedRecord[]? RelatedRecords = null,
     int? ReviewedSnapshotVersion = null, string? ReviewedContentSha256 = null, string? OperationId = null,
-    string? AdapterVersion = null, string? ModelVersion = null, string? SourceTextSha256 = null);
+    string? AdapterVersion = null, string? ModelVersion = null, string? SourceTextSha256 = null,
+    string? AccessOverride = null);
 public sealed record KnowledgeRecordView(KnowledgeRecord Metadata, string Body, string Path, string? StaleReason = null, string? IndexStatus = null);
 
 public sealed class KnowledgeSourceRefYaml
@@ -46,17 +47,18 @@ public sealed class KnowledgeRecordYaml
     public KnowledgeSourceRefYaml[]? ReviewedSources { get; set; } public string? RejectionReason { get; set; } public RelatedRecordYaml[]? RelatedRecords { get; set; }
     public int? ReviewedSnapshotVersion { get; set; } public string? ReviewedContentSha256 { get; set; }
     public string? OperationId { get; set; } public string? AdapterVersion { get; set; } public string? ModelVersion { get; set; } public string? SourceTextSha256 { get; set; }
+    public string? AccessOverride { get; set; }
     public static KnowledgeRecordYaml From(KnowledgeRecord m) => new() { SchemaVersion = m.SchemaVersion, Id = m.Id, Type = m.Type, Kind = m.Kind,
         Status = m.Status, Title = m.Title, Project = m.Project, ValidFrom = m.ValidFrom?.ToString("O"), ValidTo = m.ValidTo?.ToString("O"),
         CreatedAt = m.CreatedAt.ToString("O"), UpdatedAt = m.UpdatedAt.ToString("O"), Access = m.Access, SourceRefs = m.SourceRefs.Select(KnowledgeSourceRefYaml.From).ToArray(), History = m.History.Select(RecordTransitionYaml.From).ToArray(),
         ReviewedAt = m.ReviewedAt?.ToString("O"), ReviewedSources = m.ReviewedSources?.Select(KnowledgeSourceRefYaml.From).ToArray(), RejectionReason = m.RejectionReason,
         RelatedRecords = m.RelatedRecords?.Select(RelatedRecordYaml.From).ToArray(), ReviewedSnapshotVersion = m.ReviewedSnapshotVersion, ReviewedContentSha256 = m.ReviewedContentSha256,
-        OperationId = m.OperationId, AdapterVersion = m.AdapterVersion, ModelVersion = m.ModelVersion, SourceTextSha256 = m.SourceTextSha256 };
+        OperationId = m.OperationId, AdapterVersion = m.AdapterVersion, ModelVersion = m.ModelVersion, SourceTextSha256 = m.SourceTextSha256, AccessOverride = m.AccessOverride };
     public KnowledgeRecord ToRecord() => new(SchemaVersion, Id, Type, Kind, Status, Title, Project,
         ValidFrom is null ? null : DateTimeOffset.Parse(ValidFrom), ValidTo is null ? null : DateTimeOffset.Parse(ValidTo), DateTimeOffset.Parse(CreatedAt), DateTimeOffset.Parse(UpdatedAt),
         Access, SourceRefs.Select(x => x.ToRef()).ToArray(), History.Select(x => x.ToTransition()).ToArray(), ReviewedAt is null ? null : DateTimeOffset.Parse(ReviewedAt),
         ReviewedSources?.Select(x => x.ToRef()).ToArray(), RejectionReason, RelatedRecords?.Select(x => x.ToRelated()).ToArray(), ReviewedSnapshotVersion, ReviewedContentSha256,
-        OperationId, AdapterVersion, ModelVersion, SourceTextSha256);
+        OperationId, AdapterVersion, ModelVersion, SourceTextSha256, AccessOverride);
 }
 
 public sealed class KnowledgeRepository
@@ -86,6 +88,26 @@ public sealed class KnowledgeRepository
         var statuses = new[] { "draft", "reviewed", "archived" };
         return statuses.SelectMany(s => Directory.Exists(Folder(s)) ? Directory.EnumerateFiles(Folder(s), "*.md") : Array.Empty<string>())
             .Select(Read).OrderBy(x => x.Metadata.CreatedAt).ToArray();
+    }
+    public int MigrateToSchema3()
+    {
+        var changed = 0;
+        foreach (var view in ListCanonical())
+        {
+            if (view.Metadata.SchemaVersion == "3") continue;
+            var metadata = view.Metadata with { SchemaVersion = "3", AccessOverride = view.Metadata.Access };
+            if (metadata.Status == "reviewed" && metadata.ReviewedSnapshotVersion == SnapshotVersion)
+                metadata = metadata with { ReviewedContentSha256 = ContentHash(metadata, view.Body) };
+            Save(metadata, view.Body); changed++;
+        }
+        return changed;
+    }
+    public KnowledgeRecordView SetAccessOverride(Guid id, string? level)
+    {
+        if (level is not null and not ("local_only" or "unclassified" or "external_allowed")) throw new ArgumentException("Unsupported access level", nameof(level));
+        RecoverTransition();
+        var view = Show(id); var updated = view.Metadata with { SchemaVersion = "3", AccessOverride = level, UpdatedAt = DateTimeOffset.UtcNow };
+        Save(updated, view.Body); return Show(id);
     }
     public void RecoverPendingTransitions() => RecoverTransition();
     public IReadOnlyList<string> VerifyHistory()
@@ -150,13 +172,14 @@ public sealed class KnowledgeRepository
     }
     private static void Validate(KnowledgeRecord m, string body)
     {
-        if (m.SchemaVersion is not ("1" or "2") || m.Id == Guid.Empty || m.SourceRefs is null || m.History is null || m.SourceRefs.Any(x => x is null) || m.History.Any(x => x is null)) throw new InvalidDataException("invalid schema version or missing required fields");
+        if (m.SchemaVersion is not ("1" or "2" or "3") || m.Id == Guid.Empty || m.SourceRefs is null || m.History is null || m.SourceRefs.Any(x => x is null) || m.History.Any(x => x is null)) throw new InvalidDataException("invalid schema version or missing required fields");
         if (m.Type is not ("fact" or "decision" or "meeting" or "task" or "risk" or "question")) throw new InvalidDataException($"unsupported type '{m.Type}'");
         if (m.Kind is not ("source_claim" or "inference")) throw new InvalidDataException($"unsupported kind '{m.Kind}'");
         if (m.Status is not ("draft" or "reviewed" or "archived")) throw new InvalidDataException($"unsupported status '{m.Status}'");
         if (string.IsNullOrWhiteSpace(m.Title)) throw new InvalidDataException("title is required");
         if (string.IsNullOrWhiteSpace(body)) throw new InvalidDataException("body is required");
         if (m.Access is not ("local_only" or "unclassified" or "external_allowed")) throw new InvalidDataException($"unsupported access '{m.Access}'");
+        if (m.AccessOverride is not null and not ("local_only" or "unclassified" or "external_allowed")) throw new InvalidDataException("unsupported access_override");
         foreach (var r in m.SourceRefs) ValidateReference(r);
         var related = m.RelatedRecords ?? Array.Empty<RelatedRecord>();
         if (related.Any(x => x.RecordId == Guid.Empty || x.RecordId == m.Id || x.Type is not ("conflicts_with" or "supersedes"))) throw new InvalidDataException("related_records contains an invalid type, UUID, or self-reference");
@@ -264,8 +287,27 @@ public sealed class KnowledgeRepository
         if (!File.Exists(path)) throw new InvalidDataException($"Source {sourceId}: extracted text is unavailable");
         var text = Normalize(File.ReadAllText(path, Encoding.UTF8)); var lines = text.Split('\n'); var reference = new KnowledgeSourceRef(sourceId, Hash(text), startLine, endLine, quote, Hash(quote));
         if (!CitationMatches(lines, reference)) throw new InvalidDataException($"{sourceId}: candidate citation does not match extracted text");
-        var now = DateTimeOffset.UtcNow; var id = Guid.NewGuid(); var metadata = new KnowledgeRecord("2", id, type, kind, "draft", title, null, null, null, now, now,
-            Access(new[] { source.Access }), new[] { reference }, new[] { new RecordTransition("draft", now) }, OperationId: operationId, AdapterVersion: adapterVersion, ModelVersion: modelVersion, SourceTextSha256: Hash(text));
+        var now = DateTimeOffset.UtcNow; var id = Guid.NewGuid(); var metadata = new KnowledgeRecord("3", id, type, kind, "draft", title, null, null, null, now, now,
+            "unclassified", new[] { reference }, new[] { new RecordTransition("draft", now) }, OperationId: operationId, AdapterVersion: adapterVersion, ModelVersion: modelVersion, SourceTextSha256: Hash(text));
+        Save(metadata, body); return IndexOrMark(Show(id), index);
+    }
+    public KnowledgeRecordView DraftAgent(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, Action<KnowledgeRecordView>? index = null)
+    {
+        RecoverTransition();
+        if (citations.Count is < 1 or > 10) throw new InvalidDataException("A draft must cite between 1 and 10 sources");
+        var references = new List<KnowledgeSourceRef>();
+        foreach (var citation in citations)
+        {
+            var (_, dir) = getSource(citation.SourceId); var path = Path.Combine(dir, "extracted.txt");
+            if (!File.Exists(path)) throw new InvalidDataException("Source text is unavailable");
+            var text = Normalize(File.ReadAllText(path, Encoding.UTF8)); var reference = new KnowledgeSourceRef(citation.SourceId, Hash(text), citation.StartLine, citation.EndLine, citation.Quote, Hash(citation.Quote));
+            if (!CitationMatches(text.Split('\n'), reference)) throw new InvalidDataException("Draft citation does not match source text");
+            references.Add(reference);
+        }
+        if (references.Select(x => x.SourceId).Distinct().Count() != references.Count) throw new InvalidDataException("Duplicate source citations are not allowed");
+        var now = DateTimeOffset.UtcNow; var id = Guid.NewGuid();
+        var metadata = new KnowledgeRecord("3", id, "fact", "source_claim", "draft", title, null, null, null, now, now,
+            "unclassified", references.ToArray(), new[] { new RecordTransition("draft", now) });
         Save(metadata, body); return IndexOrMark(Show(id), index);
     }
     public KnowledgeRecordView Edit(Guid id, string markdown, string? expectedFileHash = null, Action<KnowledgeRecordView>? index = null)

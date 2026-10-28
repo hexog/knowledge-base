@@ -80,6 +80,7 @@ public sealed class SourceRepository
                     string.IsNullOrWhiteSpace(record.Extractor.Status) || record.Aliases is null ||
                     string.IsNullOrWhiteSpace(record.OriginalName) || record.ImportedAt == default || record.LastSeenAt == default)
                     throw new InvalidDataException("source.json contains invalid schema or identity fields");
+                if (record.Access is not ("local_only" or "unclassified" or "external_allowed")) throw new InvalidDataException("source.json contains an unknown access label");
                 var utcImportedAt = record.ImportedAt.ToUniversalTime(); var utcLastSeenAt = record.LastSeenAt.ToUniversalTime();
                 if (utcImportedAt != record.ImportedAt || utcLastSeenAt != record.LastSeenAt)
                     record = record with { ImportedAt = utcImportedAt, LastSeenAt = utcLastSeenAt };
@@ -332,7 +333,7 @@ public sealed class KnowledgeBaseStore
     {
         using var doc = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var obj = doc.RootElement;
         if (obj.ValueKind != JsonValueKind.Object) throw new InvalidDataException("settings.json must contain a JSON object");
-        if (!obj.TryGetProperty("schema_version", out var version) || version.GetString() is not ("1" or "2")) throw new InvalidDataException("settings.json has an unsupported schema_version");
+        if (!obj.TryGetProperty("schema_version", out var version) || version.GetString() is not ("1" or "2" or "3")) throw new InvalidDataException("settings.json has an unsupported schema_version");
         if (!obj.TryGetProperty("max_file_size_bytes", out var size) || !size.TryGetInt64(out var value) || value <= 0 || value > MaxSupportedFileBytes)
             throw new InvalidDataException($"settings.json max_file_size_bytes must be between 1 and {MaxSupportedFileBytes}");
         return value;
@@ -577,7 +578,8 @@ public sealed class KnowledgeBaseStore
 
     public object Migrate(int targetVersion)
     {
-        if (targetVersion != 2) throw new ArgumentOutOfRangeException(nameof(targetVersion), "Only migration target 2 is supported");
+        if (targetVersion == 3) return Migrate3();
+        if (targetVersion != 2) throw new ArgumentOutOfRangeException(nameof(targetVersion), "Only migration targets 2 and 3 are supported");
         using var operation = AcquireLock();
         RecoverMigration();
         Initialize();
@@ -615,6 +617,25 @@ public sealed class KnowledgeBaseStore
         return new { schema_version = "2", migrated_sources = records.Count(x => x.Record.SchemaVersion != "2"), backups, entries = changes.Select(x => new { x.Kind, x.Target, x.Sha256 }) };
     }
 
+    private object Migrate3()
+    {
+        using var operation = AcquireLock(); RecoverMigration(); Initialize(); knowledge.RecoverPendingTransitions();
+        var problems = new List<string>(); var records = repository.ReadSources(problems).ToArray();
+        if (problems.Count > 0) throw new InvalidDataException("Cannot migrate invalid metadata: " + string.Join("; ", problems));
+        if (records.Any(x => x.Record.SchemaVersion != "2")) throw new InvalidDataException("Run 'kb migrate --to 2' before migration 3");
+        using var settingsDoc = JsonDocument.Parse(File.ReadAllText(SettingsPath));
+        var settingsVersion = settingsDoc.RootElement.GetProperty("schema_version").GetString();
+        if (settingsVersion == "3" && knowledge.ListCanonical().All(x => x.Metadata.SchemaVersion == "3"))
+            return new { schema_version = "3", migrated_records = 0, migrated_sources = 0, policy_revision = ReadPolicyRevision(), already_current = true };
+        if (settingsVersion != "2") throw new InvalidDataException("Settings must be schema 2 before migration 3");
+        var migrated = knowledge.MigrateToSchema3();
+        var policyPath = Path.Combine(root, "config", "access-policy.json");
+        if (!File.Exists(policyPath)) File.WriteAllText(policyPath, "{\"schema_version\":\"1\",\"revision\":1}\n", new UTF8Encoding(false));
+        var settings = new { schema_version = "3", max_file_size_bytes = ReadMaxFileSize(), max_extracted_text_bytes = ReadMaxExtractedTextBytes() };
+        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n", new UTF8Encoding(false));
+        return new { schema_version = "3", migrated_records = migrated, migrated_sources = 0, policy_revision = ReadPolicyRevision() };
+    }
+
     private string MigrationJournalPath => Path.Combine(root, ".migration-v2.json");
     private MigrationChange PrepareMigrationChange(string target, string content, string kind)
     {
@@ -633,11 +654,19 @@ public sealed class KnowledgeBaseStore
     }
     private void CommitMigration(string path, IReadOnlyList<MigrationChange> changes, int completed)
     {
+        if (completed < 0 || completed > changes.Count) throw new InvalidDataException("Migration journal completed count is outside its valid range");
+        for (var i = 0; i < completed; i++)
+        {
+            var completedTarget = SafeMigrationPath(changes[i].Target);
+            if (!File.Exists(completedTarget) || !string.Equals(HashFile(completedTarget), changes[i].Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Completed migration target hash mismatch: {changes[i].Target}; journal and backups were preserved");
+        }
         for (var i = completed; i < changes.Count; i++)
         {
             var change = changes[i]; var target = SafeMigrationPath(change.Target); var staged = SafeMigrationPath(change.Staged);
             if (File.Exists(staged))
             {
+                if (!string.Equals(HashFile(staged), change.Sha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Staged migration hash mismatch: {change.Staged}; journal and files were preserved");
                 if (File.Exists(target) && !string.Equals(HashFile(target), change.OriginalSha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Migration target changed unexpectedly: {change.Target}");
                 if (!File.Exists(target) && change.OriginalSha256 is not null) throw new InvalidDataException($"Migration target disappeared unexpectedly: {change.Target}");
                 File.Move(staged, target, true);
@@ -656,11 +685,91 @@ public sealed class KnowledgeBaseStore
         {
             using var document = JsonDocument.Parse(File.ReadAllText(MigrationJournalPath)); var rootElement = document.RootElement;
             if (rootElement.GetProperty("format_version").GetInt32() != 1) throw new InvalidDataException("unsupported migration journal version");
+            if (rootElement.GetProperty("phase").GetString() != "committing") throw new InvalidDataException("unsupported migration journal phase");
             var changes = rootElement.GetProperty("changes").EnumerateArray().Select(x => new MigrationChange(x.GetProperty("target").GetString()!, x.GetProperty("staged").GetString()!, x.GetProperty("sha256").GetString()!, x.TryGetProperty("originalSha256", out var original) ? original.GetString() : null, x.GetProperty("kind").GetString()!)).ToArray();
-            CommitMigration(MigrationJournalPath, changes, rootElement.GetProperty("completed").GetInt32());
+            var completed = rootElement.GetProperty("completed").GetInt32();
+            if (completed < 0 || completed > changes.Length) throw new InvalidDataException("invalid completed count");
+            CommitMigration(MigrationJournalPath, changes, completed);
         }
         catch (Exception ex) { throw new InvalidDataException($"Migration recovery stopped. Inspect backups (*.v1.bak) and {MigrationJournalPath}: {ex.Message}", ex); }
     }
+
+    public long ReadPolicyRevision()
+    {
+        var path = Path.Combine(root, "config", "access-policy.json");
+        if (!File.Exists(path)) return 1;
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (!doc.RootElement.TryGetProperty("revision", out var value) || !value.TryGetInt64(out var revision) || revision < 1) throw new InvalidDataException("Access policy revision is invalid");
+        return revision;
+    }
+    private void BumpPolicyRevision(string subject, string reason)
+    {
+        var path = Path.Combine(root, "config", "access-policy.json"); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        if (string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("A reason is required", nameof(reason));
+        var revision = ReadPolicyRevision() + 1; var changes = new List<JsonElement>();
+        if (File.Exists(path))
+        {
+            using var old = JsonDocument.Parse(File.ReadAllText(path));
+            if (old.RootElement.TryGetProperty("changes", out var existing) && existing.ValueKind == JsonValueKind.Array) changes.AddRange(existing.EnumerateArray().Select(x => x.Clone()));
+        }
+        changes.Add(JsonSerializer.SerializeToElement(new { revision, at = DateTimeOffset.UtcNow, subject, reason }));
+        if (changes.Count > 10000) changes.RemoveRange(0, changes.Count - 10000);
+        var temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        File.WriteAllText(temp, JsonSerializer.Serialize(new { schema_version = "1", revision, changes }) + "\n", new UTF8Encoding(false)); File.Move(temp, path, true);
+    }
+    public long SetSourceAccess(Guid id, string level, string reason)
+    {
+        if (level is not ("local_only" or "unclassified" or "external_allowed")) throw new ArgumentException("Unsupported access level", nameof(level));
+        using var operation = AcquireLock(); var (record, dir) = Show(id);
+        if (record.Access == level) return ReadPolicyRevision();
+        if (string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("A reason is required", nameof(reason));
+        SourceRepository.SaveRecord(dir, record with { Access = level }); BumpPolicyRevision($"source:{id}", reason); return ReadPolicyRevision();
+    }
+    public long SetRecordAccessOverride(Guid id, string? level, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("A reason is required", nameof(reason));
+        using var operation = AcquireLock(); _ = knowledge.SetAccessOverride(id, level); BumpPolicyRevision($"record:{id}", reason); return ReadPolicyRevision();
+    }
+    public long PolicyRevision => ReadPolicyRevision();
+    public IDisposable AcquirePolicyGuard() => AcquireLock();
+    public string SchemaVersion
+    {
+        get { using var doc = JsonDocument.Parse(File.ReadAllText(SettingsPath)); return doc.RootElement.GetProperty("schema_version").GetString() ?? ""; }
+    }
+    public void RecoverServerState()
+    {
+        using var operation = AcquireLock(); RecoverMigration(); knowledge.RecoverPendingTransitions();
+        var transition = Path.Combine(root, "knowledge", ".record-transition.json");
+        if (File.Exists(transition)) knowledge.RecoverPendingTransitions();
+    }
+    public string EffectiveAccess(KnowledgeRecord metadata)
+    {
+        if (metadata.SourceRefs.Length == 0) return "local_only";
+        var levels = new List<string>();
+        if (metadata.AccessOverride is not null) levels.Add(metadata.AccessOverride);
+        else if (metadata.SchemaVersion != "3") levels.Add(metadata.Access);
+        foreach (var reference in metadata.SourceRefs)
+        {
+            try { levels.Add(Show(reference.SourceId).Record.Access); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException) { return "local_only"; }
+        }
+        if (levels.Any(x => x is not ("local_only" or "unclassified" or "external_allowed"))) return "local_only";
+        if (levels.Contains("local_only")) return "local_only";
+        if (levels.Contains("unclassified")) return "unclassified";
+        return "external_allowed";
+    }
+    public (SourceRecord Record, string Text) ReadExtractedSource(Guid id)
+    {
+        var (record, directory) = Show(id); var path = Path.Combine(directory, "extracted.txt");
+        if (!File.Exists(path) || record.Extractor.Status != "indexed") throw new FileNotFoundException("Source text unavailable");
+        var text = NormalizeLf(File.ReadAllText(path, Encoding.UTF8));
+        if (record.ExtractedTextSha256 is null || !string.Equals(HashText(text), record.ExtractedTextSha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Source text hash mismatch");
+        return (record, text);
+    }
+    public KnowledgeRecordView CreateAgentDraft(Guid sourceId, string title, string body, int startLine, int endLine, string quote)
+        => DraftCandidate(sourceId, title, body, startLine, endLine, quote);
+    public KnowledgeRecordView CreateAgentDraft(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations)
+        => knowledge.DraftAgent(title, body, citations, index.IndexKnowledge);
     private string SafeMigrationPath(string relative)
     {
         if (Path.IsPathRooted(relative)) throw new InvalidDataException("migration journal contains an absolute path");
