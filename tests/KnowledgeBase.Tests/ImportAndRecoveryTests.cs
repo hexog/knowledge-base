@@ -150,7 +150,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "verify consistency");
         var store = new KnowledgeBaseStore(Db); store.Import(input);
         var db = Path.Combine(Db, "index", "search.sqlite");
-        using (var connection = new SqliteConnection($"Data Source={db}"))
+        using (var connection = new SqliteConnection($"Data Source={db};Pooling=False"))
         {
             connection.Open(); using var command = connection.CreateCommand(); command.CommandText = "DELETE FROM sources"; command.ExecuteNonQuery();
         }
