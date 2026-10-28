@@ -73,11 +73,11 @@ public sealed class KnowledgeRepository
     {
         this.root = Path.Combine(root, "knowledge"); this.getSource = getSource; this.lockFactory = lockFactory;
     }
-    private string Folder(string status) => Path.Combine(root, status switch { "draft" => "drafts", "reviewed" => "reviewed", "archived" => "archived", _ => throw new InvalidDataException($"Invalid record status: {status}") });
+    private string Folder(string status) => Path.Combine(root, status switch { "draft" => "drafts", "reviewed" => "reviewed", "review_required" => "review_required", "archived" => "archived", _ => throw new InvalidDataException($"Invalid record status: {status}") });
     private string JournalPath => Path.Combine(root, ".record-transition.json");
     public IReadOnlyList<KnowledgeRecordView> List(string? status = null)
     {
-        var statuses = status is null ? new[] { "draft", "reviewed", "archived" } : status == "stale" ? new[] { "reviewed" } : new[] { status };
+        var statuses = status is null ? new[] { "draft", "reviewed", "review_required", "archived" } : status == "stale" ? new[] { "reviewed" } : new[] { status };
         var records = statuses.SelectMany(s => Directory.Exists(Folder(s)) ? Directory.EnumerateFiles(Folder(s), "*.md") : Array.Empty<string>())
             .Select(Read).Select(Effective).OrderBy(x => x.Metadata.CreatedAt).ToArray();
         if (status == "stale") return records.Where(x => x.StaleReason is not null).ToArray();
@@ -85,22 +85,96 @@ public sealed class KnowledgeRepository
     }
     public IReadOnlyList<KnowledgeRecordView> ListCanonical()
     {
-        var statuses = new[] { "draft", "reviewed", "archived" };
+        var statuses = new[] { "draft", "reviewed", "review_required", "archived" };
         return statuses.SelectMany(s => Directory.Exists(Folder(s)) ? Directory.EnumerateFiles(Folder(s), "*.md") : Array.Empty<string>())
             .Select(Read).OrderBy(x => x.Metadata.CreatedAt).ToArray();
     }
     public int MigrateToSchema3()
     {
-        var changed = 0;
-        foreach (var view in ListCanonical())
+        RecoverRecordMigration();
+        var views = ListCanonical(); // Parse and validate every canonical record before staging any changes.
+        var changes = new List<RecordMigrationChange>();
+        foreach (var view in views)
         {
             if (view.Metadata.SchemaVersion == "3") continue;
             var metadata = view.Metadata with { SchemaVersion = "3", AccessOverride = view.Metadata.Access };
-            if (metadata.Status == "reviewed" && metadata.ReviewedSnapshotVersion == SnapshotVersion)
-                metadata = metadata with { ReviewedContentSha256 = ContentHash(metadata, view.Body) };
-            Save(metadata, view.Body); changed++;
+            if (view.Metadata.Status == "reviewed")
+            {
+                var reason = LegacyReviewFailure(view);
+                if (reason is not null)
+                {
+                    SaveHistory(view, "migration_review_required: " + reason);
+                    var now = DateTimeOffset.UtcNow;
+                    metadata = metadata with { Status = "review_required", RejectionReason = reason, UpdatedAt = now,
+                        History = metadata.History.Append(new RecordTransition("review_required", now, reason)).ToArray(),
+                        ReviewedSnapshotVersion = null, ReviewedContentSha256 = null };
+                }
+                else metadata = metadata with { ReviewedContentSha256 = ContentHash(metadata, view.Body) };
+            }
+            var target = metadata.Status == view.Metadata.Status ? view.Path : Path.Combine(Folder(metadata.Status), metadata.Id + ".md");
+            if (!SamePath(target, view.Path) && File.Exists(target)) throw new InvalidDataException($"Cannot migrate record {metadata.Id}: target path already exists");
+            var rendered = Render(metadata, view.Body);
+            var staged = target + ".v3.new"; var backup = view.Path + ".v2.bak";
+            _ = SafeRecordMigrationPath(Path.GetRelativePath(root, view.Path)); _ = SafeRecordMigrationPath(Path.GetRelativePath(root, target)); _ = SafeRecordMigrationPath(Path.GetRelativePath(root, staged)); _ = SafeRecordMigrationPath(Path.GetRelativePath(root, backup));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!); WriteDurable(staged, rendered);
+            if (!File.Exists(backup)) File.Copy(view.Path, backup);
+            changes.Add(new RecordMigrationChange(Path.GetRelativePath(root, view.Path), Path.GetRelativePath(root, target), Path.GetRelativePath(root, staged), Path.GetRelativePath(root, backup), FileHash(rendered), FileHash(File.ReadAllText(view.Path, Encoding.UTF8))));
         }
-        return changed;
+        if (changes.Count == 0) return 0;
+        WriteRecordMigrationJournal(0, changes);
+        RecoverRecordMigration();
+        return changes.Count;
+    }
+    private sealed record RecordMigrationChange(string Original, string Target, string Staged, string Backup, string TargetSha256, string OriginalSha256);
+    private string RecordMigrationJournal => Path.Combine(root, ".record-migration-v3.json");
+    private string SafeRecordMigrationPath(string relative)
+    {
+        if (Path.IsPathRooted(relative)) throw new InvalidDataException("record migration journal contains an absolute path");
+        var path = Path.GetFullPath(Path.Combine(root, relative)); var prefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(prefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) throw new InvalidDataException("record migration journal escapes knowledge root");
+        for (var current = path; current.StartsWith(prefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal); current = Path.GetDirectoryName(current)!)
+            if ((File.Exists(current) || Directory.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("record migration path traverses a symbolic link");
+        return path;
+    }
+    private void WriteRecordMigrationJournal(int completed, IReadOnlyList<RecordMigrationChange> changes)
+    {
+        var temp = RecordMigrationJournal + ".tmp-" + Guid.NewGuid().ToString("N");
+        _ = SafeRecordMigrationPath(Path.GetRelativePath(root, RecordMigrationJournal)); _ = SafeRecordMigrationPath(Path.GetRelativePath(root, temp));
+        WriteDurable(temp, JsonSerializer.Serialize(new { format_version = 1, completed, changes }, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }) + "\n"); File.Move(temp, RecordMigrationJournal, true);
+    }
+    private void RecoverRecordMigration()
+    {
+        _ = SafeRecordMigrationPath(Path.GetRelativePath(root, RecordMigrationJournal));
+        if (!File.Exists(RecordMigrationJournal)) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(RecordMigrationJournal)); var json = doc.RootElement;
+            if (json.GetProperty("format_version").GetInt32() != 1) throw new InvalidDataException("unsupported record migration journal");
+            var changes = json.GetProperty("changes").EnumerateArray().Select(x => new RecordMigrationChange(x.GetProperty("original").GetString()!, x.GetProperty("target").GetString()!, x.GetProperty("staged").GetString()!, x.GetProperty("backup").GetString()!, x.GetProperty("targetSha256").GetString()!, x.GetProperty("originalSha256").GetString()!)).ToArray();
+            var completed = json.GetProperty("completed").GetInt32();
+            if (completed < 0 || completed > changes.Length) throw new InvalidDataException("invalid completed count");
+            for (var i = 0; i < completed; i++)
+            {
+                var target = SafeRecordMigrationPath(changes[i].Target);
+                if (!File.Exists(target) || FileHash(File.ReadAllText(target, Encoding.UTF8)) != changes[i].TargetSha256) throw new InvalidDataException("completed record migration target hash mismatch");
+            }
+            for (var i = completed; i < changes.Length; i++)
+            {
+                var change = changes[i]; var original = SafeRecordMigrationPath(change.Original); var target = SafeRecordMigrationPath(change.Target); var staged = SafeRecordMigrationPath(change.Staged); var backup = SafeRecordMigrationPath(change.Backup);
+                if (!File.Exists(backup) || FileHash(File.ReadAllText(backup, Encoding.UTF8)) != change.OriginalSha256) throw new InvalidDataException("record migration backup hash mismatch");
+                if (File.Exists(target) && FileHash(File.ReadAllText(target, Encoding.UTF8)) == change.TargetSha256) { }
+                else
+                {
+                    if (!File.Exists(staged) || FileHash(File.ReadAllText(staged, Encoding.UTF8)) != change.TargetSha256) throw new InvalidDataException("record migration staged file is missing or corrupt");
+                    if (!File.Exists(original) || FileHash(File.ReadAllText(original, Encoding.UTF8)) != change.OriginalSha256) throw new InvalidDataException("record migration source changed unexpectedly");
+                    Directory.CreateDirectory(Path.GetDirectoryName(target)!); File.Move(staged, target, true);
+                }
+                if (!SamePath(original, target) && File.Exists(original)) File.Delete(original);
+                WriteRecordMigrationJournal(i + 1, changes);
+            }
+            File.Delete(RecordMigrationJournal);
+        }
+        catch (Exception ex) { throw new InvalidDataException($"Record migration recovery stopped; journal and *.v2.bak files were preserved: {ex.Message}", ex); }
     }
     public KnowledgeRecordView SetAccessOverride(Guid id, string? level)
     {
@@ -109,7 +183,7 @@ public sealed class KnowledgeRepository
         var view = Show(id); var updated = view.Metadata with { SchemaVersion = "3", AccessOverride = level, UpdatedAt = DateTimeOffset.UtcNow };
         Save(updated, view.Body); return Show(id);
     }
-    public void RecoverPendingTransitions() => RecoverTransition();
+    public void RecoverPendingTransitions() { RecoverRecordMigration(); RecoverTransition(); }
     public IReadOnlyList<string> VerifyHistory()
     {
         var errors = new List<string>(); var history = Path.Combine(root, "history");
@@ -175,7 +249,7 @@ public sealed class KnowledgeRepository
         if (m.SchemaVersion is not ("1" or "2" or "3") || m.Id == Guid.Empty || m.SourceRefs is null || m.History is null || m.SourceRefs.Any(x => x is null) || m.History.Any(x => x is null)) throw new InvalidDataException("invalid schema version or missing required fields");
         if (m.Type is not ("fact" or "decision" or "meeting" or "task" or "risk" or "question")) throw new InvalidDataException($"unsupported type '{m.Type}'");
         if (m.Kind is not ("source_claim" or "inference")) throw new InvalidDataException($"unsupported kind '{m.Kind}'");
-        if (m.Status is not ("draft" or "reviewed" or "archived")) throw new InvalidDataException($"unsupported status '{m.Status}'");
+        if (m.Status is not ("draft" or "reviewed" or "review_required" or "archived")) throw new InvalidDataException($"unsupported status '{m.Status}'");
         if (string.IsNullOrWhiteSpace(m.Title)) throw new InvalidDataException("title is required");
         if (string.IsNullOrWhiteSpace(body)) throw new InvalidDataException("body is required");
         if (m.Access is not ("local_only" or "unclassified" or "external_allowed")) throw new InvalidDataException($"unsupported access '{m.Access}'");
@@ -201,7 +275,7 @@ public sealed class KnowledgeRepository
     private void Save(KnowledgeRecord metadata, string body)
     {
         Validate(metadata, body); var path = Path.Combine(Folder(metadata.Status), metadata.Id + ".md"); _ = SafeJournalPath(Path.GetRelativePath(root, path)); Directory.CreateDirectory(Folder(metadata.Status)); var temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
-        File.WriteAllText(temp, Render(metadata, body), new UTF8Encoding(false)); File.Move(temp, path, true);
+        WriteDurable(temp, Render(metadata, body)); File.Move(temp, path, true);
     }
     private void SaveHistory(KnowledgeRecordView current, string reason)
     {
@@ -280,6 +354,25 @@ public sealed class KnowledgeRepository
         }
         return reason.Length == 0 ? view : view with { Metadata = view.Metadata with { Status = "stale" }, StaleReason = reason };
     }
+    private string? LegacyReviewFailure(KnowledgeRecordView view)
+    {
+        var metadata = view.Metadata;
+        if (metadata.ReviewedSnapshotVersion != SnapshotVersion || !IsSha256(metadata.ReviewedContentSha256)) return "review_snapshot_missing_or_unknown";
+        if (!string.Equals(ContentHash(metadata, view.Body), metadata.ReviewedContentSha256, StringComparison.OrdinalIgnoreCase)) return "record_content_changed";
+        if (metadata.ReviewedSources is null || metadata.ReviewedSources.Length == 0 || !SameReviewedSources(metadata.ReviewedSources, metadata.SourceRefs)) return "reviewed_sources_mismatch";
+        foreach (var reference in metadata.ReviewedSources)
+        {
+            try
+            {
+                var (_, directory) = getSource(reference.SourceId); var textPath = Path.Combine(directory, "extracted.txt");
+                if (!File.Exists(textPath)) return "source_missing";
+                var lines = Normalize(File.ReadAllText(textPath, Encoding.UTF8)).Split('\n');
+                if (Hash(string.Join("\n", lines)) != reference.TextSha256 || !CitationMatches(lines, reference)) return "source_changed_or_quote_mismatch";
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException) { return "source_missing"; }
+        }
+        return null;
+    }
     public KnowledgeRecordView Draft(Guid sourceId, string title, string body, string type = "fact", string kind = "source_claim") => throw new InvalidDataException("Manual drafts require an explicit citation; use DraftCandidate with line range and quote");
     public KnowledgeRecordView DraftCandidate(Guid sourceId, string title, string body, int startLine, int endLine, string quote, string type = "fact", string kind = "source_claim", string? operationId = null, string? adapterVersion = null, string? modelVersion = null, Action<KnowledgeRecordView>? index = null)
     {
@@ -291,7 +384,7 @@ public sealed class KnowledgeRepository
             "unclassified", new[] { reference }, new[] { new RecordTransition("draft", now) }, OperationId: operationId, AdapterVersion: adapterVersion, ModelVersion: modelVersion, SourceTextSha256: Hash(text));
         Save(metadata, body); return IndexOrMark(Show(id), index);
     }
-    public KnowledgeRecordView DraftAgent(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, Action<KnowledgeRecordView>? index = null)
+    public KnowledgeRecordView DraftAgent(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, Action<KnowledgeRecordView>? index = null, Guid? recordId = null, string? operationId = null)
     {
         RecoverTransition();
         if (citations.Count is < 1 or > 10) throw new InvalidDataException("A draft must cite between 1 and 10 sources");
@@ -305,9 +398,10 @@ public sealed class KnowledgeRepository
             references.Add(reference);
         }
         if (references.Select(x => x.SourceId).Distinct().Count() != references.Count) throw new InvalidDataException("Duplicate source citations are not allowed");
-        var now = DateTimeOffset.UtcNow; var id = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow; var id = recordId ?? Guid.NewGuid();
+        if (ListCanonical().Any(x => x.Metadata.Id == id)) throw new IOException("operation_recovery_required");
         var metadata = new KnowledgeRecord("3", id, "fact", "source_claim", "draft", title, null, null, null, now, now,
-            "unclassified", references.ToArray(), new[] { new RecordTransition("draft", now) });
+            "unclassified", references.ToArray(), new[] { new RecordTransition("draft", now) }, OperationId: operationId);
         Save(metadata, body); return IndexOrMark(Show(id), index);
     }
     public KnowledgeRecordView Edit(Guid id, string markdown, string? expectedFileHash = null, Action<KnowledgeRecordView>? index = null)
@@ -345,7 +439,8 @@ public sealed class KnowledgeRepository
         }
         ValidateRelatedTargets(m);
         SaveHistory(current, "accepted");
-        var now = DateTimeOffset.UtcNow; var updated = m with { Status = "reviewed", Access = Access(access), UpdatedAt = now, ReviewedAt = now,
+        if (m.Status is not ("draft" or "review_required")) throw new InvalidDataException("Only draft or review_required records can be accepted");
+        var now = DateTimeOffset.UtcNow; var updated = m with { Status = "reviewed", Access = Access(access), UpdatedAt = now, ReviewedAt = now, RejectionReason = null,
             ReviewedSources = m.SourceRefs.Select(x => x with { QuoteSha256 = Hash(x.Quote) }).ToArray(), ReviewedSnapshotVersion = SnapshotVersion,
             History = m.History.Append(new RecordTransition("reviewed", now)).ToArray() };
         updated = updated with { ReviewedContentSha256 = ContentHash(updated, current.Body) };
@@ -375,7 +470,12 @@ public sealed class KnowledgeRepository
     private static bool IsSha256(string? value) => value is not null && value.Length == 64 && value.All(Uri.IsHexDigit);
     private static string Normalize(string text) => text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
     private static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
-    private static void WriteAtomic(string path, string content) { var temp = path + ".tmp-" + Guid.NewGuid().ToString("N"); File.WriteAllText(temp, content, new UTF8Encoding(false)); File.Move(temp, path, true); }
+    private static void WriteAtomic(string path, string content) { var temp = path + ".tmp-" + Guid.NewGuid().ToString("N"); WriteDurable(temp, content); File.Move(temp, path, true); }
+    private static void WriteDurable(string path, string content)
+    {
+        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false)); writer.Write(content); writer.Flush(); stream.Flush(true);
+    }
     private static string Access(IEnumerable<string> values)
     {
         var list = values.Select(x => x is "local_only" or "unclassified" or "external_allowed" ? x : "local_only").ToArray();

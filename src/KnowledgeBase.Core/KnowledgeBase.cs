@@ -348,13 +348,13 @@ public sealed class KnowledgeBaseStore
         }
         return 10L * 1024 * 1024;
     }
-    private FileStream AcquireLock()
+    private FileStream AcquireLock(TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
-        Directory.CreateDirectory(root); var path = Path.Combine(root, ".operation.lock"); var until = DateTime.UtcNow.AddSeconds(30);
+        Directory.CreateDirectory(root); var path = Path.Combine(root, ".operation.lock"); var until = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(30));
         while (true)
         {
             try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
-            catch (IOException) { if (DateTime.UtcNow >= until) throw new IOException("Knowledge base is busy; another import or index rebuild holds the lock"); Thread.Sleep(100); }
+            catch (IOException) { if (DateTime.UtcNow >= until) throw new IOException(timeout is null ? "Knowledge base is busy; another import or index rebuild holds the lock" : "retry_required"); cancellationToken.WaitHandle.WaitOne(50); cancellationToken.ThrowIfCancellationRequested(); }
         }
     }
     public ImportSummary Import(string inputPath)
@@ -630,9 +630,28 @@ public sealed class KnowledgeBaseStore
         if (settingsVersion != "2") throw new InvalidDataException("Settings must be schema 2 before migration 3");
         var migrated = knowledge.MigrateToSchema3();
         var policyPath = Path.Combine(root, "config", "access-policy.json");
-        if (!File.Exists(policyPath)) File.WriteAllText(policyPath, "{\"schema_version\":\"1\",\"revision\":1}\n", new UTF8Encoding(false));
+        if (!File.Exists(policyPath))
+        {
+            var policy = PrepareMigrationChange(policyPath, "{\"schema_version\":\"1\",\"revision\":1}\n", "policy");
+            var settingsForMigration = new { schema_version = "3", max_file_size_bytes = ReadMaxFileSize(), max_extracted_text_bytes = ReadMaxExtractedTextBytes() };
+            var settingsContent = JsonSerializer.Serialize(settingsForMigration, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n";
+            var settingChange = PrepareMigrationChange(SettingsPath, settingsContent, "settings");
+            foreach (var change in new[] { policy, settingChange }) if (change.OriginalSha256 is not null)
+            {
+                var target = SafeMigrationPath(change.Target); var backup = target + ".v2.bak";
+                if (!File.Exists(backup)) File.Copy(target, backup);
+            }
+            var changes = new[] { policy, settingChange }; WriteMigrationJournal(MigrationJournalPath, changes, 0); CommitMigration(MigrationJournalPath, changes, 0);
+            return new { schema_version = "3", migrated_records = migrated, migrated_sources = 0, policy_revision = ReadPolicyRevision() };
+        }
         var settings = new { schema_version = "3", max_file_size_bytes = ReadMaxFileSize(), max_extracted_text_bytes = ReadMaxExtractedTextBytes() };
-        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n", new UTF8Encoding(false));
+        var settingsTarget = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower }) + "\n";
+        var settingsChangeOnly = PrepareMigrationChange(SettingsPath, settingsTarget, "settings");
+        if (settingsChangeOnly.OriginalSha256 is not null)
+        {
+            var backup = SafeMigrationPath(settingsChangeOnly.Target) + ".v2.bak"; if (!File.Exists(backup)) File.Copy(SafeMigrationPath(settingsChangeOnly.Target), backup);
+        }
+        WriteMigrationJournal(MigrationJournalPath, new[] { settingsChangeOnly }, 0); CommitMigration(MigrationJournalPath, new[] { settingsChangeOnly }, 0);
         return new { schema_version = "3", migrated_records = migrated, migrated_sources = 0, policy_revision = ReadPolicyRevision() };
     }
 
@@ -731,7 +750,8 @@ public sealed class KnowledgeBaseStore
         using var operation = AcquireLock(); _ = knowledge.SetAccessOverride(id, level); BumpPolicyRevision($"record:{id}", reason); return ReadPolicyRevision();
     }
     public long PolicyRevision => ReadPolicyRevision();
-    public IDisposable AcquirePolicyGuard() => AcquireLock();
+    public IDisposable AcquirePolicyGuard() => AcquireLock(TimeSpan.FromSeconds(5));
+    public IDisposable AcquirePolicyGuard(CancellationToken cancellationToken) => AcquireLock(TimeSpan.FromSeconds(5), cancellationToken);
     public string SchemaVersion
     {
         get { using var doc = JsonDocument.Parse(File.ReadAllText(SettingsPath)); return doc.RootElement.GetProperty("schema_version").GetString() ?? ""; }
@@ -768,8 +788,8 @@ public sealed class KnowledgeBaseStore
     }
     public KnowledgeRecordView CreateAgentDraft(Guid sourceId, string title, string body, int startLine, int endLine, string quote)
         => DraftCandidate(sourceId, title, body, startLine, endLine, quote);
-    public KnowledgeRecordView CreateAgentDraft(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations)
-        => knowledge.DraftAgent(title, body, citations, index.IndexKnowledge);
+    public KnowledgeRecordView CreateAgentDraft(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, Guid? recordId = null, string? operationId = null)
+        => knowledge.DraftAgent(title, body, citations, index.IndexKnowledge, recordId, operationId);
     private string SafeMigrationPath(string relative)
     {
         if (Path.IsPathRooted(relative)) throw new InvalidDataException("migration journal contains an absolute path");

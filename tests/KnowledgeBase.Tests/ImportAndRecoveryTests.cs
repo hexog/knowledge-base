@@ -395,6 +395,29 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void Schema3MigrationDemotesEditedLegacyReviewedRecordAndOwnerCanReaccept()
+    {
+        var input = Path.Combine(temp, "legacy-reviewed.txt"); File.WriteAllText(input, "The original evidence sentence.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        store.Migrate(2);
+        var draft = store.DraftCandidate(sourceId, "Legacy claim", "Original claim body.", 1, 1, "The original evidence sentence.");
+        var reviewed = store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        var downgraded = reviewed.Metadata with { SchemaVersion = "2" };
+        var oldHash = KnowledgeRepository.ContentHash(downgraded, reviewed.Body);
+        var markdown = File.ReadAllText(reviewed.Path).Replace(reviewed.Metadata.ReviewedContentSha256!, oldHash, StringComparison.Ordinal)
+            .Replace("Original claim body.", "Edited claim body.", StringComparison.Ordinal);
+        markdown = string.Join("\n", markdown.Split('\n').Select(line => line.StartsWith("schema_version:", StringComparison.Ordinal) ? "schema_version: \"2\"" : line));
+        File.WriteAllText(reviewed.Path, markdown);
+        store.Migrate(3);
+        var needsReview = store.ShowRecord(reviewed.Metadata.Id);
+        Assert.Equal("review_required", needsReview.Metadata.Status);
+        Assert.Equal("record_content_changed", needsReview.Metadata.RejectionReason);
+        Assert.Contains(needsReview.Metadata.History, x => x.Status == "review_required" && x.Reason == "record_content_changed");
+        Assert.Throws<FileNotFoundException>(() => new AgentKnowledgeService(store, new byte[32]).GetRecord(reviewed.Metadata.Id, "external"));
+        Assert.Equal("reviewed", store.AcceptRecord(reviewed.Metadata.Id, new[] { sourceId }).Metadata.Status);
+    }
+
+    [Fact]
     public void ExternalAgentAccessTracksCurrentSourceClassification()
     {
         var input = Path.Combine(temp, "policy.txt"); File.WriteAllText(input, "A cited policy line.\nMore context.");
@@ -421,6 +444,52 @@ public sealed class ImportAndRecoveryTests : IDisposable
         Assert.Equal(issued.ClientId, registry.Authenticate(issued.Token)?.ClientId);
         Assert.True(registry.Revoke(issued.ClientId));
         Assert.Null(registry.Authenticate(issued.Token));
+    }
+
+    [Fact]
+    public void ClientRegistrySerializesConcurrentWritersAcrossInstances()
+    {
+        var path = Path.Combine(temp, "concurrent-clients.json");
+        var registries = Enumerable.Range(0, 8).Select(_ => new ClientRegistry(path)).ToArray();
+        Parallel.For(0, registries.Length, i => registries[i].Create("local", new[] { "search" }));
+        using var json = JsonDocument.Parse(File.ReadAllText(path));
+        Assert.Equal(registries.Length, json.RootElement.GetArrayLength());
+    }
+
+    [Fact]
+    public void IdempotencyStorePersistsStableReceiptAndRejectsDigestConflict()
+    {
+        var state = Path.Combine(temp, "gateway-state"); var first = new IdempotencyStore(state);
+        var operation = first.Reserve("client-a", "draft-key", "digest-a", new[] { Guid.NewGuid() }, new[] { "sourcehash" }, out var replay);
+        Assert.False(replay);
+        var receipt = new DraftReceipt(operation.RecordId, "draft", operation.OperationId, 17);
+        first.Update(operation, "record_saved", receipt); first.Update(operation with { Phase = "record_saved", Receipt = receipt }, "completed", receipt);
+        var restarted = new IdempotencyStore(state);
+        var repeated = restarted.Reserve("client-a", "draft-key", "digest-a", operation.SourceIds, operation.DependencyHashes!, out replay);
+        Assert.True(replay);
+        Assert.Equal(operation.RecordId, repeated.Receipt!.Id);
+        Assert.Equal(receipt, repeated.Receipt);
+        Assert.Throws<InvalidOperationException>(() => restarted.Reserve("client-a", "draft-key", "digest-b", operation.SourceIds, operation.DependencyHashes!, out _));
+    }
+
+    [Fact]
+    public void AgentSearchCursorIsOpaqueBoundAndExpiresOnPolicyRevisionChange()
+    {
+        var input = Path.Combine(temp, "cursor-source.txt"); File.WriteAllText(input, "Cursor evidence line.");
+        var store = new KnowledgeBaseStore(Db); var sourceId = store.Import(input).Items.Single().SourceId!.Value;
+        foreach (var title in new[] { "Cursor claim one", "Cursor claim two" })
+        {
+            var draft = store.DraftCandidate(sourceId, title, "Cursorword searchable body.", 1, 1, "Cursor evidence line.");
+            store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
+        }
+        store.SetSourceAccess(sourceId, "external_allowed", "Allowed for cursor test");
+        var service = new AgentKnowledgeService(store, new byte[32]);
+        var first = service.Search("cursorword", 1, null, "external", "client-one", new[] { "search" });
+        Assert.NotNull(first.Cursor); Assert.DoesNotContain("offset", first.Cursor!, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(first.Results);
+        Assert.Throws<ArgumentException>(() => service.Search("cursorword", 1, first.Cursor, "external", "client-two", new[] { "search" }));
+        store.SetSourceAccess(sourceId, "local_only", "Revoke cursor visibility");
+        Assert.Throws<IOException>(() => service.Search("cursorword", 1, first.Cursor, "external", "client-one", new[] { "search" }));
     }
 
     [Fact]

@@ -1,6 +1,6 @@
 # Agent gateway MVP
 
-The gateway is a separate loopback-only HTTP process. It reads the same file database as `kb`; do not give an agent direct filesystem access to the database, server state, or client registry.
+The gateway is a separate loopback-only HTTP process. It reads the same file database as `kb`; do not give an agent direct filesystem access to the database, server state, or client registry. Run only one server process for a given server state directory. A process lock rejects a second server using that state. Do not point multiple state directories at one database.
 
 ## Prepare and start
 
@@ -11,6 +11,8 @@ KB_DATABASE_PATH=/path/to/knowledge-base dotnet run --project src/KnowledgeBase.
 ```
 
 The listener binds to `127.0.0.1:8765`. Set `KB_SERVER_PORT` to choose another loopback port. `KB_SERVER_STATE_PATH` selects the cursor key, audit log, and idempotency state directory. `KB_CLIENT_REGISTRY_PATH` selects the credential registry; both paths should be outside the portable database and protected by the owner's filesystem permissions.
+
+Back up the database, server state directory, and client registry together while the server is stopped. The state directory contains the cursor key, audit log, and durable draft-operation journal (`idempotency.json`). The registry contains client token hashes. These files are not part of the portable knowledge archive. Restoring only the database or only the server state can lose replay guarantees; keep the matching backup set.
 
 ## Credentials
 
@@ -31,6 +33,10 @@ The create command prints a random bearer token once. The registry stores only i
 
 All calls require `Authorization: Bearer TOKEN`. The applicable scope is `search`, `read`, or `draft`. Responses use `Cache-Control: no-store`; requests with an `Origin` header are rejected. Missing and inaccessible resources share the same `404 resource_unavailable` response.
 
-The external profile receives only current reviewed records whose effective access is `external_allowed`; each cited source must also be explicitly external allowed. The local profile can inspect valid records in any status. Draft submissions always create drafts and never invoke the local extractor or accept records.
+The external profile receives only current reviewed records whose effective access is `external_allowed`; each cited source must also be explicitly external allowed. The local profile can inspect valid records in any status, including `review_required`. Only the owner can accept a `review_required` record, and acceptance rechecks every source citation. Draft submissions always create drafts and never invoke the local extractor or accept records.
+
+Draft creation requires an ASCII `Idempotency-Key` of 1–128 characters from letters, digits, `-`, `_`, `.`, or `:`. The first successful response is `201` and includes a stable record ID, operation ID, `status: draft`, and the policy revision at creation. Repeating the same client/key and normalized payload replays the same creation receipt with `Idempotency-Replayed: true`; it does not read the current record or change the receipt when the owner later accepts or archives that record. Reusing the key for a different payload returns `409 idempotency_conflict`. Source access is checked again on every replay. Reserved operations are recoverable after restart and keep their preallocated record ID; an ambiguous record collision requires owner recovery rather than creating a second draft.
+
+The server accepts request bodies up to 1 MiB, allows up to 8 active HTTP requests plus a bounded waiting queue, and waits up to 5 seconds for a database operation lock. Slow request bodies are limited to 10 seconds. Queue overflow returns `429`; database lock timeout returns `503 retry_required`. These are server limits, not client-tunable request fields. Search cursors are random server session tokens, expire after 10 minutes, and are invalidated when the policy revision or client binding changes.
 
 Classification changes take effect on subsequent requests. They cannot retract content already delivered to a client. The audit log records operation metadata and resource IDs, not queries, document text, citations, or tokens. Audit write failures prevent successful responses.
