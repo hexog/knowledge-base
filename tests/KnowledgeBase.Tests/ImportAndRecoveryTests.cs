@@ -674,6 +674,29 @@ public sealed class ImportAndRecoveryTests : IDisposable
         Assert.True(error.RootElement.TryGetProperty("request_id", out _));
     }
 
+    [Fact]
+    public async Task GatewayLogsDraftValidationReasonWithoutExposingItInResponse()
+    {
+        var store = new KnowledgeBaseStore(Db);
+        var registryPath = Path.Combine(temp, "clients.json");
+        var issued = new ClientRegistry(registryPath).Create("external", new[] { "draft" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), registryPath);
+        const string privateBody = "sensitive draft body marker";
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/drafts");
+        request.Headers.Authorization = new("Bearer", issued.Token);
+        request.Headers.Add("Idempotency-Key", "test-draft-log");
+        request.Content = new StringContent(JsonSerializer.Serialize(new { title = "Draft", body = privateBody, citations = Array.Empty<object>() }), Encoding.UTF8, "application/json");
+
+        using var response = await server.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        using var error = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("invalid_request", error.RootElement.GetProperty("error").GetString());
+        var requestId = error.RootElement.GetProperty("request_id").GetString()!;
+        Assert.True(SpinWait.SpinUntil(() => server.StandardError.Contains(requestId), TimeSpan.FromSeconds(5)));
+        Assert.Contains("citations must contain between 1 and 10 items", server.StandardError);
+        Assert.DoesNotContain(privateBody, server.StandardError);
+    }
+
     [Theory]
     [InlineData("edit")]
     [InlineData("archive")]
@@ -837,8 +860,11 @@ public sealed class ImportAndRecoveryTests : IDisposable
     private sealed class GatewayProcess : IDisposable
     {
         private readonly string database; private readonly string state; private readonly string registry; private readonly int port;
+        private readonly StringBuilder standardError = new();
+        private readonly object standardErrorLock = new();
         private Process process = null!;
         public HttpClient Client { get; }
+        public string StandardError { get { lock (standardErrorLock) return standardError.ToString(); } }
         public GatewayProcess(string database, string state, string registry)
         {
             this.database = database; this.state = state; this.registry = registry; port = ReservePort();
@@ -851,14 +877,17 @@ public sealed class ImportAndRecoveryTests : IDisposable
             var root = FindRepositoryRoot(); var output = new DirectoryInfo(AppContext.BaseDirectory); var configuration = output.Parent!.Name;
             var serverDll = Path.Combine(root, "src", "KnowledgeBase.Server", "bin", configuration, output.Name, "KnowledgeBase.Server.dll");
             if (!File.Exists(serverDll)) throw new FileNotFoundException("Gateway server build output was not found", serverDll);
-            var start = new ProcessStartInfo("dotnet") { UseShellExecute = false, RedirectStandardError = true };
+            var start = new ProcessStartInfo("dotnet") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
             start.ArgumentList.Add(serverDll); start.Environment["KB_DATABASE_PATH"] = database; start.Environment["KB_SERVER_STATE_PATH"] = state;
             start.Environment["KB_CLIENT_REGISTRY_PATH"] = registry; start.Environment["KB_SERVER_PORT"] = port.ToString();
             process = Process.Start(start) ?? throw new InvalidOperationException("Could not start gateway process");
-            var stderr = process.StandardError.ReadToEndAsync();
+            process.ErrorDataReceived += (_, args) => { if (args.Data is not null) lock (standardErrorLock) standardError.AppendLine(args.Data); };
+            process.OutputDataReceived += (_, args) => { if (args.Data is not null) lock (standardErrorLock) standardError.AppendLine(args.Data); };
+            process.BeginErrorReadLine();
+            process.BeginOutputReadLine();
             for (var i = 0; i < 100; i++)
             {
-                if (process.HasExited) throw new InvalidOperationException($"Gateway exited during startup: {stderr.GetAwaiter().GetResult()}");
+                if (process.HasExited) throw new InvalidOperationException($"Gateway exited during startup: {StandardError}");
                 try
                 {
                     using var response = Client.PostAsync("/v1/search", new StringContent("{}", Encoding.UTF8, "application/json")).GetAwaiter().GetResult();

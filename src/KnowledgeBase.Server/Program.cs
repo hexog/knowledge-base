@@ -71,7 +71,9 @@ app.MapPost("/v1/search", async (HttpContext context) =>
     try
     {
         var req = await ReadJson<SearchRequest>(context);
-        if (req is null || string.IsNullOrWhiteSpace(req.Query) || req.Query.Length > 512 || req.Limit is < 1 or > 50) return await ErrorResult(context, 400, "invalid_request");
+        if (req is null) { LogRequestFailure(context, "search", "request body is empty or invalid"); return await ErrorResult(context, 400, "invalid_request"); }
+        if (string.IsNullOrWhiteSpace(req.Query) || req.Query.Length > 512) { LogRequestFailure(context, "search", "query must contain 1 to 512 characters"); return await ErrorResult(context, 400, "invalid_request"); }
+        if (req.Limit is < 1 or > 50) { LogRequestFailure(context, "search", "limit must be between 1 and 50"); return await ErrorResult(context, 400, "invalid_request"); }
         using var clientGuard = clients.AcquireGuard(context.RequestAborted);
         using var guard = store.AcquirePolicyGuard(context.RequestAborted);
         if (!StillAuthorized(context, auth, "search")) return await Revoked(context, auth, "search");
@@ -105,7 +107,7 @@ app.MapGet("/v1/sources/{id:guid}/text", async (HttpContext context, Guid id) =>
     if (!HasScope(auth, "read")) return await Denied(context, auth, "source_read", "forbidden");
     try
     {
-        if (!int.TryParse(context.Request.Query["start_line"], out var start_line) || !int.TryParse(context.Request.Query["end_line"], out var end_line)) return await ErrorResult(context, 400, "invalid_request");
+        if (!int.TryParse(context.Request.Query["start_line"], out var start_line) || !int.TryParse(context.Request.Query["end_line"], out var end_line)) { LogRequestFailure(context, "source_read", "start_line and end_line must be integers"); return await ErrorResult(context, 400, "invalid_request"); }
         using var clientGuard = clients.AcquireGuard(context.RequestAborted); using var guard = store.AcquirePolicyGuard(context.RequestAborted); if (!StillAuthorized(context, auth, "read")) return await Revoked(context, auth, "source_read");
         var revision = store.PolicyRevision; var source = service.GetSourceText(id, start_line, end_line, auth.Profile);
         if (revision != store.PolicyRevision) return await Fail(context, auth, "source_read", revision, 409, "retry_required");
@@ -122,10 +124,12 @@ app.MapPost("/v1/drafts", async (HttpContext context) =>
     try
     {
         var key = context.Request.Headers["Idempotency-Key"].ToString();
-        if (!ValidIdempotencyKey(key)) return await ErrorResult(context, 400, "invalid_request");
+        if (!ValidIdempotencyKey(key)) { LogRequestFailure(context, "draft", "Idempotency-Key is missing or has an invalid format"); return await ErrorResult(context, 400, "invalid_request"); }
         var req = await ReadJson<DraftRequest>(context);
-        if (req is null || string.IsNullOrWhiteSpace(req.Title) || string.IsNullOrWhiteSpace(req.Body) || Encoding.UTF8.GetByteCount(req.Body) > 64 * 1024 || req.Citations is null || req.Citations.Length is < 1 or > 10)
-            return await ErrorResult(context, 400, "invalid_request");
+        if (req is null) { LogRequestFailure(context, "draft", "request body is empty or invalid"); return await ErrorResult(context, 400, "invalid_request"); }
+        if (string.IsNullOrWhiteSpace(req.Title)) { LogRequestFailure(context, "draft", "title is required"); return await ErrorResult(context, 400, "invalid_request"); }
+        if (string.IsNullOrWhiteSpace(req.Body) || Encoding.UTF8.GetByteCount(req.Body) > 64 * 1024) { LogRequestFailure(context, "draft", "body is required and must not exceed 65536 UTF-8 bytes"); return await ErrorResult(context, 400, "invalid_request"); }
+        if (req.Citations is null || req.Citations.Length is < 1 or > 10) { LogRequestFailure(context, "draft", "citations must contain between 1 and 10 items"); return await ErrorResult(context, 400, "invalid_request"); }
         var digest = DraftDigest(req); var sourceIds = req.Citations.Select(x => x.SourceId).ToArray();
         using var clientGuard = clients.AcquireGuard(context.RequestAborted);
         using var guard = store.AcquirePolicyGuard(context.RequestAborted);
@@ -215,8 +219,14 @@ async Task<IResult> HandleFailure(HttpContext context, Exception ex, ClientCrede
         IOException => (503, "service_unavailable"),
         _ => (503, "service_unavailable")
     };
+    if (status >= 500)
+        app.Logger.LogError(ex, "Request {RequestId} operation {Operation} failed with {ErrorCode}", RequestId(context), operation, error);
+    else
+        app.Logger.LogWarning("Request {RequestId} operation {Operation} failed with {ErrorCode}: {ExceptionType}: {Reason}", RequestId(context), operation, error, ex.GetType().Name, ex.Message);
     return await Fail(context, client, operation, CurrentRevision(), status, error);
 }
+void LogRequestFailure(HttpContext context, string operation, string reason) =>
+    app.Logger.LogWarning("Request {RequestId} operation {Operation} rejected: {Reason}", RequestId(context), operation, reason);
 async Task<IResult> ErrorResult(HttpContext context, int status, string error) => Results.Json(new { error, request_id = RequestId(context) }, statusCode: status);
 async Task WriteError(HttpContext context, int status, string error)
 {
