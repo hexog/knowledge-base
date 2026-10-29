@@ -119,8 +119,22 @@ public sealed class SearchIndex
 {
     private static string HashText(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
     private readonly string database;
-    public SearchIndex(string root) => database = Path.Combine(root, "index", "search.sqlite");
+    private readonly string root;
+    public SearchIndex(string root)
+    {
+        this.root = Path.GetFullPath(root);
+        var normalizedRoot = NormalizePath(this.root);
+        var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedRoot))).ToLowerInvariant();
+        database = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KnowledgeBase", "index", key, "search.sqlite");
+    }
     public string DatabasePath => database;
+    private static string NormalizePath(string path)
+    {
+        var fullPath = Path.GetFullPath(path).Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        var root = Path.GetPathRoot(fullPath)!;
+        fullPath = fullPath.Length > root.Length ? fullPath.TrimEnd(Path.DirectorySeparatorChar) : fullPath;
+        return OperatingSystem.IsWindows() ? fullPath.ToUpperInvariant() : fullPath;
+    }
     private SqliteConnection Open(string? path = null)
     {
         var c = new SqliteConnection($"Data Source={path ?? database};Pooling=False"); c.Open(); return c;
@@ -260,7 +274,7 @@ public sealed class SearchIndex
                 !RowMatches(pair.Value, rowList[0]) || ftsList[0].Name != pair.Value.OriginalName || ftsList[0].Type != pair.Value.SourceType).Select(pair => pair.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var record in records)
             {
-                var dir = Path.Combine(Path.GetDirectoryName(database)!, "..", "sources", record.SourceId.ToString());
+                var dir = Path.Combine(root, "sources", record.SourceId.ToString());
                 var original = Path.Combine(dir, record.OriginalRelativePath ?? "original.bin");
                 if (!File.Exists(original) || !string.Equals(HashFile(original), record.ContentSha256, StringComparison.OrdinalIgnoreCase)) missingIds.Add(record.SourceId.ToString());
                 if (record.Extractor.Status == "indexed")
@@ -329,7 +343,7 @@ public sealed class KnowledgeBaseStore
     private bool SourceExists(Guid id) { try { Show(id); return true; } catch (FileNotFoundException) { return false; } }
     public void Initialize()
     {
-        Directory.CreateDirectory(repository.SourcesPath); Directory.CreateDirectory(Path.Combine(root, "index")); Directory.CreateDirectory(Path.Combine(root, "config"));
+        Directory.CreateDirectory(repository.SourcesPath); Directory.CreateDirectory(Path.Combine(root, "config"));
         if (!File.Exists(SettingsPath)) File.WriteAllText(SettingsPath, "{\"schema_version\":\"2\",\"max_file_size_bytes\":52428800,\"max_extracted_text_bytes\":10485760}\n");
         if (!Directory.EnumerateDirectories(repository.SourcesPath).Any(d => !Path.GetFileName(d).StartsWith(".tmp-", StringComparison.Ordinal))) index.Ensure();
     }
@@ -354,7 +368,8 @@ public sealed class KnowledgeBaseStore
     }
     private FileStream AcquireLock(TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
-        Directory.CreateDirectory(root); var path = Path.Combine(root, ".operation.lock"); var until = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(30));
+        var localDirectory = Path.GetDirectoryName(index.DatabasePath)!; Directory.CreateDirectory(localDirectory);
+        var path = Path.Combine(localDirectory, ".operation.lock"); var until = DateTime.UtcNow.Add(timeout ?? TimeSpan.FromSeconds(30));
         while (true)
         {
             try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
@@ -558,6 +573,7 @@ public sealed class KnowledgeBaseStore
         {
             schema_version = "1",
             index_exists = File.Exists(index.DatabasePath),
+            local_index_path = index.DatabasePath,
             total = records.Length,
             statuses = records.GroupBy(x => x.Extractor.Status).ToDictionary(g => g.Key, g => g.Count()),
             invalid_metadata = problems.Count,

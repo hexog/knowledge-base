@@ -51,8 +51,9 @@ sources/<source_id>/source.json, original.*, extracted.txt
 knowledge/drafts/<record_id>.md
 knowledge/reviewed/<record_id>.md
 knowledge/archived/<record_id>.md
-index/search.sqlite
 ```
+
+Поисковый SQLite индекс — локальный производный кеш вне переносимой папки; он восстанавливается из перечисленных канонических файлов. Подробнее — в [инструкции по синхронизации](database-sync.md).
 
 Каждая запись — UTF-8 Markdown с YAML front matter и телом. ID — UUID, стабильный при редактировании и перемещении между статусами. Версия схемы задаётся явно. Обязательные поля:
 

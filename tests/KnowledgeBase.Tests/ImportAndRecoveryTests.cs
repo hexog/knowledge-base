@@ -126,7 +126,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
         var imported = RunCli("--json", "--db", Db, "import", input);
         var sourceId = JsonDocument.Parse(imported.Stdout).RootElement.GetProperty("items")[0].GetProperty("source_id").GetGuid();
         var draft = RunCli("--json", "--db", Db, "record", "draft", "--source", sourceId.ToString(), "--title", "CLI knowledge claim", "--body", "The claim has evidence.", "--start-line", "1", "--end-line", "1", "--quote", "Exact CLI citation.");
-        Assert.Equal(0, draft.ExitCode);
+        Assert.True(draft.ExitCode == 0, draft.Stdout + draft.Stderr);
         var recordId = JsonDocument.Parse(draft.Stdout).RootElement.GetProperty("record").GetProperty("metadata").GetProperty("id").GetGuid();
         var shown = RunCli("--json", "--db", Db, "record", "show", recordId.ToString(), "--sources");
         Assert.Equal("Exact CLI citation.", JsonDocument.Parse(shown.Stdout).RootElement.GetProperty("sources")[0].GetProperty("quote").GetString());
@@ -170,7 +170,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
     {
         var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "verify consistency");
         var store = new KnowledgeBaseStore(Db); store.Import(input);
-        var db = Path.Combine(Db, "index", "search.sqlite");
+        var db = new SearchIndex(Db).DatabasePath;
         using (var connection = new SqliteConnection($"Data Source={db};Pooling=False"))
         {
             connection.Open(); using var command = connection.CreateCommand(); command.CommandText = "DELETE FROM sources"; command.ExecuteNonQuery();
@@ -196,16 +196,38 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void LocalIndexAndOperationLockAreOutsidePortableDatabaseAndScopedToDatabasePath()
+    {
+        var firstPath = Path.Combine(temp, "first-db"); var secondPath = Path.Combine(temp, "second-db");
+        var first = new KnowledgeBaseStore(firstPath); first.Rebuild();
+        var second = new KnowledgeBaseStore(secondPath); second.Rebuild();
+        var firstIndexPath = new SearchIndex(firstPath).DatabasePath;
+        var secondIndexPath = new SearchIndex(secondPath).DatabasePath;
+        var firstLockPath = Path.Combine(Path.GetDirectoryName(firstIndexPath)!, ".operation.lock");
+        var secondLockPath = Path.Combine(Path.GetDirectoryName(secondIndexPath)!, ".operation.lock");
+
+        Assert.False(firstIndexPath.StartsWith(Path.GetFullPath(firstPath), StringComparison.Ordinal));
+        Assert.NotEqual(firstIndexPath, secondIndexPath);
+        Assert.NotEqual(firstLockPath, secondLockPath);
+        Assert.True(File.Exists(firstIndexPath));
+        Assert.True(File.Exists(firstLockPath));
+        Assert.True(File.Exists(secondLockPath));
+        Assert.Equal(firstIndexPath, new SearchIndex(Path.Combine(firstPath, "..", "first-db")).DatabasePath);
+        var status = JsonDocument.Parse(JsonSerializer.Serialize(first.Status())).RootElement;
+        Assert.Equal(firstIndexPath, status.GetProperty("local_index_path").GetString());
+    }
+
+    [Fact]
     public void MissingIndexSearchRequiresRebuildAndRebuildRejectsMissingIndexedText()
     {
         var input = Path.Combine(temp, "input.txt"); File.WriteAllText(input, "index recoverable text");
         var store = new KnowledgeBaseStore(Db); var id = store.Import(input).Items.Single().SourceId!.Value; var source = store.Show(id);
-        File.Delete(Path.Combine(Db, "index", "search.sqlite"));
+        File.Delete(new SearchIndex(Db).DatabasePath);
         Assert.Throws<InvalidDataException>(() => store.Search("recoverable"));
         store.Rebuild(); Assert.Single(store.Search("recoverable"));
-        var before = File.ReadAllBytes(Path.Combine(Db, "index", "search.sqlite")); File.Delete(Path.Combine(source.Directory, "extracted.txt"));
+        var before = File.ReadAllBytes(new SearchIndex(Db).DatabasePath); File.Delete(Path.Combine(source.Directory, "extracted.txt"));
         Assert.Throws<InvalidDataException>(() => store.Rebuild());
-        Assert.Equal(before, File.ReadAllBytes(Path.Combine(Db, "index", "search.sqlite")));
+        Assert.Equal(before, File.ReadAllBytes(new SearchIndex(Db).DatabasePath));
     }
 
     [Fact]
@@ -249,7 +271,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
         Assert.Empty(store.SearchKnowledge("distinctive"));
         store.AcceptRecord(draft.Metadata.Id, new[] { sourceId });
         Assert.Single(store.SearchKnowledge("distinctive"));
-        File.Delete(Path.Combine(Db, "index", "search.sqlite"));
+        File.Delete(new SearchIndex(Db).DatabasePath);
         Assert.Throws<InvalidDataException>(() => store.SearchKnowledge("distinctive"));
         Assert.Equal(1, store.Rebuild().KnowledgeIndexed);
         Assert.Single(store.SearchKnowledge("distinctive"));
@@ -897,7 +919,7 @@ public sealed class ImportAndRecoveryTests : IDisposable
     {
         var assembly = Path.Combine(AppContext.BaseDirectory, "KnowledgeBase.Cli.dll");
         var start = new ProcessStartInfo("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        start.Environment.Remove("EDITOR"); start.Environment.Remove("VISUAL");
+        start.Environment["EDITOR"] = ""; start.Environment["VISUAL"] = "";
         if (environment is not null) foreach (var (key, value) in environment) start.Environment[key] = value;
         start.ArgumentList.Add(assembly); foreach (var argument in arguments) start.ArgumentList.Add(argument);
         using var process = Process.Start(start)!; var stdout = process.StandardOutput.ReadToEnd(); var stderr = process.StandardError.ReadToEnd(); process.WaitForExit();
