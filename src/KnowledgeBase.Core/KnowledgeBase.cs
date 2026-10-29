@@ -10,14 +10,14 @@ namespace KnowledgeBase.Core;
 public sealed record ExtractorInfo(string Name, string Version, string Status, string? Error = null);
 public sealed record SourceRecord(string SchemaVersion, Guid SourceId, string ContentSha256, string OriginalName,
     string SourceType, string? MimeType, DateTimeOffset ImportedAt, DateTimeOffset LastSeenAt, string? OriginPath,
-    ExtractorInfo Extractor, string Access, string[] Aliases, string? OriginalRelativePath = null, string? ExtractedTextSha256 = null);
+    ExtractorInfo Extractor, string Access, string[] Aliases, string? OriginalRelativePath = null, string? ExtractedTextSha256 = null, string[]? OriginUrls = null);
 public sealed record ImportItem(string Path, string Status, Guid? SourceId = null, string? Message = null, string? Details = null);
 public sealed record RebuildResult(int Indexed, int Skipped, int KnowledgeIndexed = 0);
 public sealed record KnowledgeSearchResult(Guid Id, string Title, string Type, string Status, string Access, string Snippet, Guid[] SourceIds);
 public sealed record ImportSummary(int Imported, int Duplicates, int Indexed, int Unsupported, int Errors, int Oversized,
     int SkippedSymlinks, IReadOnlyList<ImportItem> Items);
 public sealed record SearchResult(Guid SourceId, string OriginalName, string SourceType, DateTimeOffset ImportedAt,
-    string SourcePath, string Snippet, string Status);
+    string SourcePath, string Snippet, string Status, string[]? OriginUrls = null);
 public sealed record ExtractionResult(string? Text, string Name, string Status, string? Error = null);
 
 public interface ITextExtractor { bool Supports(string path); ExtractionResult Extract(string path); }
@@ -376,8 +376,13 @@ public sealed class KnowledgeBaseStore
             catch (IOException) { if (DateTime.UtcNow >= until) throw new IOException(timeout is null ? "Knowledge base is busy; another import or index rebuild holds the lock" : "retry_required"); cancellationToken.WaitHandle.WaitOne(50); cancellationToken.ThrowIfCancellationRequested(); }
         }
     }
-    public ImportSummary Import(string inputPath)
+    public ImportSummary Import(string inputPath, string? originUrl = null)
     {
+        if (originUrl is not null)
+        {
+            if (!Uri.TryCreate(originUrl, UriKind.Absolute, out var parsedUrl) || parsedUrl.Scheme is not ("http" or "https")) throw new ArgumentException("Origin URL must be an absolute HTTP(S) URL", nameof(originUrl));
+            originUrl = parsedUrl.AbsoluteUri;
+        }
         if (!File.Exists(inputPath) && !Directory.Exists(inputPath)) throw new FileNotFoundException("Input path does not exist", inputPath);
         using var operation = AcquireLock(); Initialize(); var maxSize = ReadMaxFileSize(); var maxTextSize = ReadMaxExtractedTextBytes(); var fullInput = Path.GetFullPath(inputPath);
         if (string.Equals(fullInput.TrimEnd(Path.DirectorySeparatorChar), root.TrimEnd(Path.DirectorySeparatorChar), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) throw new InvalidDataException("Cannot import the knowledge-base root");
@@ -400,7 +405,9 @@ public sealed class KnowledgeBaseStore
                 if (byHash.TryGetValue(sourceHash, out var existing))
                 {
                     var aliases = existing.Record.Aliases.Append(relative).Distinct(StringComparer.Ordinal).ToArray();
-                    var updated = existing.Record with { LastSeenAt = DateTimeOffset.UtcNow, Aliases = aliases };
+                    var originUrls = existing.Record.OriginUrls ?? Array.Empty<string>();
+                    if (originUrl is not null) originUrls = originUrls.Append(originUrl).Distinct(StringComparer.Ordinal).ToArray();
+                    var updated = existing.Record with { LastSeenAt = DateTimeOffset.UtcNow, Aliases = aliases, OriginUrls = originUrls };
                     SourceRepository.SaveRecord(existing.Directory, updated); byHash[sourceHash] = (updated, existing.Directory); duplicates++;
                     try
                     {
@@ -426,7 +433,7 @@ public sealed class KnowledgeBaseStore
                     }
                     var now = DateTimeOffset.UtcNow; var record = new SourceRecord("1", id, copiedHash, Path.GetFileName(file), "file", Mime(file), now, now, relative,
                         new(extraction.Name, "1", extraction.Status, extraction.Status == "extraction_error" ? (extraction.Name == "pdfpig" ? "PDF could not be read" : "Text could not be read") : extraction.Error),
-                        "unclassified", Array.Empty<string>(), originalRelative, extraction.Text is null ? null : HashText(extraction.Text));
+                        "unclassified", Array.Empty<string>(), originalRelative, extraction.Text is null ? null : HashText(extraction.Text), originUrl is null ? Array.Empty<string>() : new[] { originUrl });
                     SourceRepository.SaveRecord(temp, record); var final = repository.SourcePath(id); Directory.Move(temp, final); imported++;
                     if (record.Extractor.Status == "indexed") indexed++;
                     if (record.Extractor.Status == "unsupported") unsupported++;
@@ -446,6 +453,13 @@ public sealed class KnowledgeBaseStore
             }
         }
         return new(imported, duplicates, indexed, unsupported, errors, oversized, skippedLinks, items);
+    }
+    public ImportSummary ImportText(string text, string? originUrl = null)
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "kb-text-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        try { var tempPath = Path.Combine(tempDirectory, "text.txt"); File.WriteAllText(tempPath, text, new UTF8Encoding(false)); return Import(tempPath, originUrl); }
+        finally { if (Directory.Exists(tempDirectory)) Directory.Delete(tempDirectory, true); }
     }
     private static string HashFile(string path) { using var stream = File.OpenRead(path); return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant(); }
     private static string HashText(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
@@ -525,9 +539,9 @@ public sealed class KnowledgeBaseStore
     private static string? Mime(string file) => Path.GetExtension(file).ToLowerInvariant() switch { ".txt" => "text/plain", ".md" => "text/markdown", ".html" or ".htm" => "text/html", ".json" => "application/json", ".csv" => "text/csv", ".pdf" => "application/pdf", _ => null };
     public IReadOnlyList<SearchResult> Search(string query, int limit = 10, string? sourceType = null, DateTimeOffset? from = null, DateTimeOffset? to = null, string? status = null)
     {
-        var paths = repository.ReadSources().ToDictionary(x => x.Record.SourceId, x => $"sources/{x.Record.SourceId}/{(x.Record.OriginalRelativePath ?? "original.bin").Replace('\\', '/')}");
+        var sources = repository.ReadSources().ToDictionary(x => x.Record.SourceId, x => x.Record);
         return index.Search(query, limit, sourceType, from, to, status)
-            .Select(result => paths.TryGetValue(result.SourceId, out var path) ? result with { SourcePath = path } : result).ToArray();
+            .Select(result => sources.TryGetValue(result.SourceId, out var source) ? result with { SourcePath = $"sources/{source.SourceId}/{(source.OriginalRelativePath ?? "original.bin").Replace('\\', '/')}", OriginUrls = source.OriginUrls ?? Array.Empty<string>() } : result).ToArray();
     }
     public (SourceRecord Record, string Directory) Show(Guid id)
     {

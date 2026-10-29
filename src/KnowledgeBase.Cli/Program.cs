@@ -27,6 +27,10 @@ init.SetAction(parse => Run(() =>
 var importPath = new Argument<string>("path") { Description = "File or directory to import" };
 var import = new Command("import", "Import a file or directory"); import.Arguments.Add(importPath);
 import.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Import(parse.GetValue(importPath)!), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var textToImport = new Option<string?>("--text") { Description = "Text to import; if omitted, read from standard input" };
+var originUrlOption = new Option<string?>("--url") { Description = "Absolute HTTP(S) URL where the text originated" };
+var importText = new Command("import-text", "Import plain text from an argument or standard input"); importText.Options.Add(textToImport); importText.Options.Add(originUrlOption);
+importText.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).ImportText(parse.GetValue(textToImport) ?? Console.In.ReadToEnd(), parse.GetValue(originUrlOption)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
 var query = new Argument<string>("query") { Description = "Full-text search query" };
 var typeOption = new Option<string?>("--type") { Description = "Filter by source type" };
@@ -182,7 +186,7 @@ feedbackCommand.Subcommands.Add(feedbackAdd); feedbackCommand.Subcommands.Add(fe
 var extract = new Command("extract", "Create draft suggestions with an explicitly configured local process"); var extractSource = new Option<Guid>("--source") { Required = true }; extract.Options.Add(extractSource);
 extract.SetAction(parse => Run(() => InvokeLocalExtractor(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(extractSource), LocalExtractorSettings.Load(applicationConfiguration)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
-root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(feedbackCommand); root.Subcommands.Add(extract);
+root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(importText); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(feedbackCommand); root.Subcommands.Add(extract);
 var parseResult = root.Parse(args);
 var jsonRequested = args.Contains("--json", StringComparer.Ordinal);
 if (parseResult.Errors.Count > 0)
@@ -250,7 +254,7 @@ static void PrintHuman<T>(T result)
             break;
         case IReadOnlyList<SearchResult> results:
             if (results.Count == 0) Console.WriteLine("No results.");
-            foreach (var x in results) Console.WriteLine($"{x.SourceId}  {x.OriginalName}  {x.ImportedAt:u}\n  {x.Snippet}\n  {x.SourcePath}");
+            foreach (var x in results) Console.WriteLine($"{x.SourceId}  {x.OriginalName}  {x.ImportedAt:u}\n  {x.Snippet}\n  {x.SourcePath}{((x.OriginUrls?.Length ?? 0) == 0 ? "" : $"\n  origins: {string.Join(", ", x.OriginUrls!)}")}");
             break;
         case IReadOnlyList<KnowledgeSearchResult> knowledge:
             if (knowledge.Count == 0) Console.WriteLine("No results.");

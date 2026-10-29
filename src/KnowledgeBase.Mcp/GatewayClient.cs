@@ -108,6 +108,7 @@ internal sealed class GatewayClient : IDisposable
         if (method == HttpMethod.Get && route.StartsWith("/v1/sources/", StringComparison.Ordinal))
         {
             RequiredGuid(root, "source_id"); RequiredString(root, "name");
+            if (root.TryGetProperty("origin_urls", out var originUrls) && originUrls.ValueKind != JsonValueKind.Array) throw new JsonException("origin_urls must be an array.");
             RequiredInteger(root, "start_line"); RequiredInteger(root, "end_line");
             RequiredString(root, "text"); RequiredInteger(root, "policy_revision");
             return;
@@ -135,6 +136,7 @@ internal sealed class GatewayClient : IDisposable
     private static void ValidateCitation(JsonElement citation)
     {
         EnsureObject(citation);
+        if (citation.TryGetProperty("origin_urls", out var originUrls) && originUrls.ValueKind != JsonValueKind.Array) throw new JsonException("origin_urls must be an array.");
         RequiredGuid(citation, "source_id"); RequiredString(citation, "text_sha256");
         RequiredInteger(citation, "start_line"); RequiredInteger(citation, "end_line"); RequiredString(citation, "text");
     }

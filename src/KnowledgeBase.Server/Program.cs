@@ -111,7 +111,7 @@ app.MapGet("/v1/sources/{id:guid}/text", async (HttpContext context, Guid id) =>
         using var clientGuard = clients.AcquireGuard(context.RequestAborted); using var guard = store.AcquirePolicyGuard(context.RequestAborted); if (!StillAuthorized(context, auth, "read")) return await Revoked(context, auth, "source_read");
         var revision = store.PolicyRevision; var source = service.GetSourceText(id, start_line, end_line, auth.Profile);
         if (revision != store.PolicyRevision) return await Fail(context, auth, "source_read", revision, 409, "retry_required");
-        var result = new { source_id = source.SourceId, name = source.Name, start_line, end_line = source.EndLine, text = source.Text, policy_revision = revision };
+        var result = new { source_id = source.SourceId, name = source.Name, origin_urls = source.OriginUrls, start_line, end_line = source.EndLine, text = source.Text, policy_revision = revision };
         audit.Write(RequestId(context), auth.ClientId, auth.Profile, "source_read", "ok", revision, new[] { id }); return Results.Ok(result);
     }
     catch (Exception ex) { return await HandleFailure(context, ex, auth, "source_read"); }
@@ -265,7 +265,7 @@ static string DraftDigest(DraftRequest request)
     var normalized = new { title = request.Title.Normalize(NormalizationForm.FormC), body = request.Body.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Normalize(NormalizationForm.FormC), citations = request.Citations.Select(x => new { source_id = x.SourceId, start_line = x.StartLine, end_line = x.EndLine, quote = x.Quote.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Normalize(NormalizationForm.FormC) }).ToArray() };
     return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(normalized))).ToLowerInvariant();
 }
-static object CitationDto(AgentCitation c) => new { source_id = c.SourceId, text_sha256 = c.TextSha256, start_line = c.StartLine, end_line = c.EndLine, text = c.Quote };
+static object CitationDto(AgentCitation c) => new { source_id = c.SourceId, origin_urls = c.OriginUrls, text_sha256 = c.TextSha256, start_line = c.StartLine, end_line = c.EndLine, text = c.Quote };
 static string Snippet(string body, string query)
 {
     var line = body.Split('\n').FirstOrDefault(x => x.Contains(query.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0], StringComparison.OrdinalIgnoreCase)) ?? body;

@@ -37,6 +37,21 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void ImportTextStoresAllUniqueOriginUrls()
+    {
+        const string text = "Simple text content for origin-link testing.";
+        var first = RunCli("--json", "--db", Db, "import-text", "--text", text, "--url", "https://example.com/first");
+        var second = RunCli("--json", "--db", Db, "import-text", "--text", text, "--url", "https://example.com/second");
+        Assert.Equal(0, first.ExitCode);
+        Assert.Equal(0, second.ExitCode);
+        using var secondResult = JsonDocument.Parse(second.Stdout);
+        var id = secondResult.RootElement.GetProperty("items")[0].GetProperty("source_id").GetGuid();
+        var store = new KnowledgeBaseStore(Db);
+        Assert.Equal(new[] { "https://example.com/first", "https://example.com/second" }, store.Show(id).Record.OriginUrls);
+        Assert.Contains("https://example.com/first", store.Search("Simple").Single().OriginUrls!);
+    }
+
+    [Fact]
     public void ContinuesAfterErrorsAndHonorsSettingsAndIgnoreGlobs()
     {
         var input = Path.Combine(temp, "input"); Directory.CreateDirectory(Path.Combine(input, "private"));

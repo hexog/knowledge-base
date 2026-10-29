@@ -4,7 +4,7 @@ using System.Text.Json;
 
 namespace KnowledgeBase.Core;
 
-public sealed record AgentCitation(Guid SourceId, string TextSha256, int StartLine, int EndLine, string Quote);
+public sealed record AgentCitation(Guid SourceId, string TextSha256, int StartLine, int EndLine, string Quote, string[] OriginUrls);
 public sealed record AgentRecord(Guid Id, string Version, string Type, string Kind, string Status, string Title, string Body, AgentCitation[] Citations, long PolicyRevision);
 public sealed record AgentSearchPage(AgentRecord[] Results, string? Cursor, long PolicyRevision);
 
@@ -104,7 +104,7 @@ public sealed class AgentKnowledgeService
 
     public AgentRecord GetRecord(Guid id, string profile) => Resolve(id, profile) ?? throw new FileNotFoundException("resource_unavailable");
 
-    public (Guid SourceId, string Name, string Text, int EndLine, long Revision) GetSourceText(Guid id, int startLine, int endLine, string profile)
+    public (Guid SourceId, string Name, string[] OriginUrls, string Text, int EndLine, long Revision) GetSourceText(Guid id, int startLine, int endLine, string profile)
     {
         if (profile is not ("local" or "external")) throw new FileNotFoundException("resource_unavailable");
         var metadata = store.Show(id).Record;
@@ -118,7 +118,7 @@ public sealed class AgentKnowledgeService
         var content = startLine > actualEndLine ? "" : string.Join("\n", lines[(startLine - 1)..actualEndLine]);
         if (Encoding.UTF8.GetByteCount(content) > 64 * 1024) throw new ArgumentException("Source range exceeds limit");
         if (revision != store.PolicyRevision) throw new IOException("policy_changed");
-        return (id, source.OriginalName, content, actualEndLine, revision);
+        return (id, source.OriginalName, source.OriginUrls ?? Array.Empty<string>(), content, actualEndLine, revision);
     }
 
     public AgentRecord CreateDraft(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, string profile)
@@ -161,7 +161,7 @@ public sealed class AgentKnowledgeService
             if (reference.EndLine > lines.Length || string.Join("\n", lines[(reference.StartLine - 1)..reference.EndLine]) != reference.Quote || !string.Equals(reference.TextSha256, source.ExtractedTextSha256, StringComparison.OrdinalIgnoreCase)) return null;
             citedBytes += Encoding.UTF8.GetByteCount(reference.Quote);
             if (citedBytes > 64 * 1024) return null;
-            citations.Add(new(reference.SourceId, reference.TextSha256, reference.StartLine, reference.EndLine, reference.Quote));
+            citations.Add(new(reference.SourceId, reference.TextSha256, reference.StartLine, reference.EndLine, reference.Quote, source.OriginUrls ?? Array.Empty<string>()));
         }
         if (revision != store.PolicyRevision) throw new IOException("policy_changed");
         return new(record.Metadata.Id, KnowledgeRepository.ContentHash(record.Metadata, record.Body), record.Metadata.Type, record.Metadata.Kind,
@@ -170,7 +170,7 @@ public sealed class AgentKnowledgeService
 
     private AgentRecord ToDto(KnowledgeRecordView view, long revision) => new(view.Metadata.Id, KnowledgeRepository.ContentHash(view.Metadata, view.Body), view.Metadata.Type,
         view.Metadata.Kind, view.Metadata.Status, view.Metadata.Title, view.Body,
-        view.Metadata.SourceRefs.Select(x => new AgentCitation(x.SourceId, x.TextSha256, x.StartLine, x.EndLine, x.Quote)).ToArray(), revision);
+        view.Metadata.SourceRefs.Select(x => { var (source, _) = store.Show(x.SourceId); return new AgentCitation(x.SourceId, x.TextSha256, x.StartLine, x.EndLine, x.Quote, source.OriginUrls ?? Array.Empty<string>()); }).ToArray(), revision);
 
     private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 }
