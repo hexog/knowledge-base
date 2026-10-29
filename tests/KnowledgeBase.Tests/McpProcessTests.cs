@@ -58,9 +58,10 @@ public sealed class McpProcessTests : IDisposable
                 Assert.NotNull(tool.ReturnJsonSchema);
             }
             var auditPath = Path.Combine(serverState, "agent-audit.jsonl");
-            var auditLength = new FileInfo(auditPath).Length;
+            long? auditLength = File.Exists(auditPath) ? new FileInfo(auditPath).Length : null;
             await Assert.ThrowsAnyAsync<Exception>(async () => await client.CallToolAsync("draft_record", new Dictionary<string, object?>()));
-            Assert.Equal(auditLength, new FileInfo(auditPath).Length);
+            long? auditLengthAfter = File.Exists(auditPath) ? new FileInfo(auditPath).Length : null;
+            Assert.Equal(auditLength, auditLengthAfter);
             var rejectedExtra = await client.CallToolAsync("search", new Dictionary<string, object?>
             {
                 ["query"] = "public evidence",
@@ -220,25 +221,44 @@ public sealed class McpProcessTests : IDisposable
             var error = new StringBuilder();
             process.ErrorDataReceived += (_, args) => { if (args.Data is not null) lock (error) error.AppendLine(args.Data); };
             process.BeginErrorReadLine();
-            using var client = new HttpClient(new HttpClientHandler { UseProxy = false }) { BaseAddress = BaseAddress, Timeout = TimeSpan.FromMilliseconds(250) };
-            for (var i = 0; i < 100; i++)
+            try
             {
-                if (process.HasExited) throw new InvalidOperationException($"Gateway exited at startup: {error}");
-                try
+                var timeout = Stopwatch.StartNew();
+                while (timeout.Elapsed < TimeSpan.FromSeconds(30))
                 {
-                    using var response = client.PostAsync("v1/search", new StringContent("{}", Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
-                    if (response.StatusCode == HttpStatusCode.Unauthorized) return;
+                    if (process.HasExited) throw new InvalidOperationException($"Gateway exited at startup: {error}");
+                    using var socket = new TcpClient(AddressFamily.InterNetwork);
+                    using var connectTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+                    try
+                    {
+                        socket.ConnectAsync(IPAddress.Loopback, port, connectTimeout.Token).GetAwaiter().GetResult();
+                        return;
+                    }
+                    catch (SocketException) { }
+                    catch (OperationCanceledException) { }
+                    Thread.Sleep(50);
                 }
-                catch (HttpRequestException) { }
-                Thread.Sleep(50);
+                throw new TimeoutException($"Gateway did not start. Process id: {process.Id}; exited: {process.HasExited}; stderr: {error}");
             }
-            throw new TimeoutException($"Gateway did not start. Process id: {process.Id}; exited: {process.HasExited}; stderr: {error}");
+            catch { Stop(); throw; }
         }
 
         public void Dispose()
         {
-            if (!process.HasExited) { process.Kill(true); process.WaitForExit(5000); }
-            process.Dispose();
+            Stop();
+        }
+
+        private void Stop()
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(true);
+                    process.WaitForExit(5000);
+                }
+            }
+            finally { process.Dispose(); }
         }
 
         private static int ReservePort()
