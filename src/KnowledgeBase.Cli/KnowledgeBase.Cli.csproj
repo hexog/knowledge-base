@@ -13,7 +13,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.CommandLine" Version="2.0.2" />
+    <PackageReference Include="System.CommandLine" Version="3.0.0-rc.3.26522.148" />
     <ProjectReference Include="..\KnowledgeBase.Configuration\KnowledgeBase.Configuration.csproj" />
     <ProjectReference Include="..\KnowledgeBase.Core\KnowledgeBase.Core.csproj" />
   </ItemGroup>
