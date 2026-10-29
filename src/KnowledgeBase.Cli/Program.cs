@@ -75,7 +75,7 @@ var migrate = new Command("migrate", "Migrate the knowledge base"); migrate.Opti
 migrate.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Migrate(parse.GetValue(migrateVersion)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
 var access = new Command("access", "Manage source and record access classifications");
-var accessSource = new Option<Guid?>("--source"); var accessRecord = new Option<Guid?>("--record");
+var accessSource = new Option<Guid?>("--source") { Description = "Source identifier (GUID)" }; var accessRecord = new Option<Guid?>("--record") { Description = "Record identifier (GUID)" };
 var accessShow = new Command("show", "Show current and effective access"); accessShow.Options.Add(accessSource); accessShow.Options.Add(accessRecord);
 accessShow.SetAction(parse => Run<object>(() =>
 {
@@ -85,7 +85,7 @@ accessShow.SetAction(parse => Run<object>(() =>
     var view = store.ShowRecord(record!.Value); var effective = store.EffectiveAccess(view.Metadata);
     return new { record_id = view.Metadata.Id, access_override = view.Metadata.AccessOverride, effective_access = effective, policy_revision = store.PolicyRevision };
 }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
-var accessSet = new Command("set", "Set an owner classification override"); var accessLevel = new Option<string>("--level") { Required = true }; var accessReason = new Option<string>("--reason") { Required = true };
+var accessSet = new Command("set", "Set an owner classification override"); var accessLevel = new Option<string>("--level") { Required = true, Description = "Access level: local_only, unclassified, or external_allowed" }; var accessReason = new Option<string>("--reason") { Required = true, Description = "Reason for the access change; recorded in policy history" };
 accessSet.Options.Add(accessSource); accessSet.Options.Add(accessRecord); accessSet.Options.Add(accessLevel); accessSet.Options.Add(accessReason);
 accessSet.SetAction(parse => Run<object>(() =>
 {
@@ -99,7 +99,7 @@ var accessClear = new Command("clear", "Remove a record access override"); acces
 accessClear.SetAction(parse => Run<object>(() => { var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!); var id = parse.GetValue(accessRecord) ?? throw new ArgumentException("--record is required"); return new { policy_revision = store.SetRecordAccessOverride(id, null, parse.GetValue(accessReason)!), access_override = (string?)null }; }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 access.Subcommands.Add(accessShow); access.Subcommands.Add(accessSet); access.Subcommands.Add(accessClear);
 
-var clients = new Command("client", "Manage agent API clients"); var profileOption = new Option<string>("--profile") { Required = true }; var scopesOption = new Option<string>("--scopes") { Required = true };
+var clients = new Command("client", "Manage agent API clients"); var profileOption = new Option<string>("--profile") { Required = true, Description = "Client profile: local or external" }; var scopesOption = new Option<string>("--scopes") { Required = true, Description = "Comma-separated scopes: search, read, draft" };
 var clientCreate = new Command("create", "Create a bearer credential (shown once)"); clientCreate.Options.Add(profileOption); clientCreate.Options.Add(scopesOption);
 clientCreate.SetAction(parse => Run<object>(() =>
 {

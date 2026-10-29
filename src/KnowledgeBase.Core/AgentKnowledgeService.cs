@@ -104,7 +104,7 @@ public sealed class AgentKnowledgeService
 
     public AgentRecord GetRecord(Guid id, string profile) => Resolve(id, profile) ?? throw new FileNotFoundException("resource_unavailable");
 
-    public (Guid SourceId, string Name, string Text, long Revision) GetSourceText(Guid id, int startLine, int endLine, string profile)
+    public (Guid SourceId, string Name, string Text, int EndLine, long Revision) GetSourceText(Guid id, int startLine, int endLine, string profile)
     {
         if (profile is not ("local" or "external")) throw new FileNotFoundException("resource_unavailable");
         var metadata = store.Show(id).Record;
@@ -113,11 +113,12 @@ public sealed class AgentKnowledgeService
         var (source, text) = store.ReadExtractedSource(id);
         if (profile == "external" && source.Access != "external_allowed") throw new FileNotFoundException("resource_unavailable");
         var lines = text.Split('\n');
-        if (startLine < 1 || endLine < startLine || endLine > lines.Length || endLine - startLine + 1 > 200) throw new ArgumentException("Invalid line range");
-        var content = string.Join("\n", lines[(startLine - 1)..endLine]);
+        if (startLine < 1 || endLine < startLine || endLine - startLine + 1 > 200) throw new ArgumentException("Invalid line range");
+        var actualEndLine = Math.Min(endLine, lines.Length);
+        var content = startLine > actualEndLine ? "" : string.Join("\n", lines[(startLine - 1)..actualEndLine]);
         if (Encoding.UTF8.GetByteCount(content) > 64 * 1024) throw new ArgumentException("Source range exceeds limit");
         if (revision != store.PolicyRevision) throw new IOException("policy_changed");
-        return (id, source.OriginalName, content, revision);
+        return (id, source.OriginalName, content, actualEndLine, revision);
     }
 
     public AgentRecord CreateDraft(string title, string body, IReadOnlyList<(Guid SourceId, int StartLine, int EndLine, string Quote)> citations, string profile)

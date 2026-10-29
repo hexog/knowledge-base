@@ -36,7 +36,7 @@ public sealed class McpProcessTests : IDisposable
         const string privateFeedbackMarker = "feedback-private-mcp-marker";
         store.Feedback.Add("other", "useful", "positive", privateFeedbackMarker);
         var sourcePath = Path.Combine(temp, "evidence.txt");
-        File.WriteAllText(sourcePath, "MCP public evidence citation.\nSecond line.");
+        File.WriteAllText(sourcePath, "MCP public evidence citation.\nВторая строка.");
         var sourceId = store.Import(sourcePath).Items.Single().SourceId!.Value;
         store.SetSourceAccess(sourceId, "external_allowed", "MCP integration test");
         var record = store.CreateAgentDraft("MCP integration record", "MCP public evidence is available through the gateway.", [(sourceId, 1, 1, "MCP public evidence citation.")]);
@@ -92,6 +92,30 @@ public sealed class McpProcessTests : IDisposable
             });
             Assert.True(source.IsError != true, JsonSerializer.Serialize(source.Content));
             Assert.Contains("MCP public evidence citation", JsonSerializer.Serialize(source.StructuredContent));
+            var longRangeSource = await client.CallToolAsync("get_source_text", new Dictionary<string, object?>
+            {
+                ["source_id"] = sourceId,
+                ["start_line"] = 1,
+                ["end_line"] = 20
+            });
+            Assert.True(longRangeSource.IsError != true, JsonSerializer.Serialize(longRangeSource.Content));
+            var longRangeJson = Assert.IsType<TextContentBlock>(Assert.Single(longRangeSource.Content)).Text;
+            Assert.Contains("Вторая строка", longRangeJson);
+            Assert.DoesNotContain("\\u0412", longRangeJson, StringComparison.OrdinalIgnoreCase);
+            using (var longRangeData = JsonDocument.Parse(longRangeJson))
+                Assert.Equal(2, longRangeData.RootElement.GetProperty("data").GetProperty("end_line").GetInt32());
+            var pastEndSource = await client.CallToolAsync("get_source_text", new Dictionary<string, object?>
+            {
+                ["source_id"] = sourceId,
+                ["start_line"] = 5,
+                ["end_line"] = 10
+            });
+            Assert.True(pastEndSource.IsError != true, JsonSerializer.Serialize(pastEndSource.Content));
+            using (var pastEndData = JsonDocument.Parse(Assert.IsType<TextContentBlock>(Assert.Single(pastEndSource.Content)).Text))
+            {
+                Assert.Equal(2, pastEndData.RootElement.GetProperty("data").GetProperty("end_line").GetInt32());
+                Assert.Equal("", pastEndData.RootElement.GetProperty("data").GetProperty("text").GetString());
+            }
             var readRecord = await client.CallToolAsync("get_record", new Dictionary<string, object?> { ["id"] = record.Metadata.Id });
             Assert.Contains(record.Metadata.Id.ToString(), JsonSerializer.Serialize(readRecord.StructuredContent));
             var unavailable = await client.CallToolAsync("get_record", new Dictionary<string, object?> { ["id"] = Guid.NewGuid() });

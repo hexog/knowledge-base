@@ -473,6 +473,30 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public void ClientCreateHelpDescribesProfilesAndScopes()
+    {
+        var result = RunCli("client", "create", "--help");
+        var help = result.Stdout + result.Stderr;
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("Client profile: local or external", help);
+        Assert.Contains("Comma-separated scopes: search, read, draft", help);
+    }
+
+    [Fact]
+    public void AccessSetHelpDescribesOptionsAndAllowedLevels()
+    {
+        var result = RunCli("access", "set", "--help");
+        var help = result.Stdout + result.Stderr;
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("Source identifier (GUID)", help);
+        Assert.Contains("Record identifier (GUID)", help);
+        Assert.Contains("Access level: local_only, unclassified, or external_allowed", help);
+        Assert.Contains("Reason for the access change; recorded in policy history", help);
+    }
+
+    [Fact]
     public void ClientRegistrySerializesConcurrentWritersAcrossInstances()
     {
         var path = Path.Combine(temp, "concurrent-clients.json");

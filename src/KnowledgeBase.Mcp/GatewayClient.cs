@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using KnowledgeBase.Configuration;
 using ModelContextProtocol;
@@ -209,7 +210,7 @@ internal sealed class ToolConcurrency
 
 internal static class McpResults
 {
-    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     public static ModelContextProtocol.Protocol.CallToolResult Success(JsonElement payload, string? idempotencyKey = null)
     {
         var serialized = JsonSerializer.Serialize(payload, Json);
