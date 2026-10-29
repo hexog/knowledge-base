@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text;
@@ -100,15 +101,13 @@ var clients = new Command("client", "Manage agent API clients"); var profileOpti
 var clientCreate = new Command("create", "Create a bearer credential (shown once)"); clientCreate.Options.Add(profileOption); clientCreate.Options.Add(scopesOption);
 clientCreate.SetAction(parse => Run<object>(() =>
 {
-    var path = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "clients.json");
-    var issued = new ClientRegistry(path).Create(parse.GetValue(profileOption)!, parse.GetValue(scopesOption)!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    var issued = new ClientRegistry(GetClientRegistryPath()).Create(parse.GetValue(profileOption)!, parse.GetValue(scopesOption)!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
     return issued;
 }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 var clientRevoke = new Command("revoke", "Revoke an agent API client"); var clientId = new Argument<string>("client-id"); clientRevoke.Arguments.Add(clientId);
 clientRevoke.SetAction(parse => Run<object>(() =>
 {
-    var path = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "clients.json");
-    if (!new ClientRegistry(path).Revoke(parse.GetValue(clientId)!)) throw new FileNotFoundException("Client not found"); return new { revoked = true };
+    if (!new ClientRegistry(GetClientRegistryPath()).Revoke(parse.GetValue(clientId)!)) throw new FileNotFoundException("Client not found"); return new { revoked = true };
 }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 clients.Subcommands.Add(clientCreate); clients.Subcommands.Add(clientRevoke);
 
@@ -153,7 +152,7 @@ var jsonRequested = args.Contains("--json", StringComparer.Ordinal);
 if (parseResult.Errors.Count > 0)
 {
     var errors = parseResult.Errors.Select(e => e.Message).ToArray();
-    if (jsonRequested) Console.WriteLine(JsonSerializer.Serialize(new { error = "argument_error", messages = errors }));
+    if (jsonRequested) Console.WriteLine(JsonSerializer.Serialize(new { error = "argument_error", messages = errors }, CreateJsonOutputOptions()));
     else { foreach (var error in errors) Console.Error.WriteLine($"Error: {error}"); Console.Error.WriteLine("Use 'kb --help' for command usage."); }
     return 2;
 }
@@ -164,7 +163,6 @@ static int Run<T>(Func<T> action, bool json, bool verbose)
     try
     {
         var result = action();
-        var jsonOptions = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
         if (json)
         {
             object? output = result;
@@ -174,7 +172,7 @@ static int Run<T>(Func<T> action, bool json, bool verbose)
                     summary = new { importSummary.Imported, importSummary.Duplicates, importSummary.Indexed, importSummary.Unsupported, importSummary.Errors, importSummary.Oversized, importSummary.SkippedSymlinks },
                     items = importSummary.Items.Select(i => new { i.Path, i.Status, i.SourceId, i.Message, Details = verbose ? i.Details : null })
                 };
-            Console.WriteLine(JsonSerializer.Serialize(output, jsonOptions));
+            Console.WriteLine(JsonSerializer.Serialize(output, CreateJsonOutputOptions()));
         }
         else PrintHuman(result);
         if (result is ImportSummary summary && (summary.Errors > 0 || summary.Oversized > 0)) return 1;
@@ -183,10 +181,28 @@ static int Run<T>(Func<T> action, bool json, bool verbose)
     }
     catch (Exception ex)
     {
-        if (json) Console.WriteLine(JsonSerializer.Serialize(new { error = ex.Message, details = verbose ? ex.ToString() : null }));
+        if (json) Console.WriteLine(JsonSerializer.Serialize(new { error = ex.Message, details = verbose ? ex.ToString() : null }, CreateJsonOutputOptions()));
         else { Console.Error.WriteLine($"Error: {ex.Message}"); if (verbose) Console.Error.WriteLine(ex); }
         return 1;
     }
+}
+
+static JsonSerializerOptions CreateJsonOutputOptions() => new()
+{
+    Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    WriteIndented = true,
+    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+};
+
+static string GetClientRegistryPath()
+{
+    var explicitPath = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH");
+    if (!string.IsNullOrWhiteSpace(explicitPath)) return explicitPath;
+
+    var statePath = Environment.GetEnvironmentVariable("KB_SERVER_STATE_PATH")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "server");
+    return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(statePath))!, "clients.json");
 }
 
 static void PrintHuman<T>(T result)

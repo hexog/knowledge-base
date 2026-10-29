@@ -1,22 +1,22 @@
 # MCP pilot results
 
-Status: **Awaiting manual OpenCode run**
+Status: **10 of 10 pilot checks completed manually; run metadata incomplete**
 
 Do not invent results. Automated process tests use synthetic data and do not count as a real LLM pilot.
 
 ## Run details
 
-- Commit:
-- Date:
+- Commit: `b3ef518` plus uncommitted MCP output-schema change in `src/KnowledgeBase.Mcp/Program.cs`
+- Date: 2026-10-29–2026-10-30
 - OpenCode version:
 - MCP SDK version: `ModelContextProtocol 2.3.0`
 - Model/provider:
-- Gateway profile and scopes:
-- Corpus and approval reference:
-- Human operator:
-- Scenarios completed by a person:
+- Gateway profile and scopes: Not recorded; search and source-read calls succeeded
+- Corpus and approval reference: Synthetic test corpus at `/tmp/kb_test`; approval reference not recorded
+- Human operator: Manual OpenCode run; name not recorded
+- Scenarios completed by a person: Search for the PostgreSQL decision; read the record and verify the exact source quote (lines 3–3); ask about a subject absent from the corpus and check abstention; ask for decision date and rationale, then explicitly read the omitted source line 4; prepare an evidence-based brief with source gaps; challenge the source with a false date and verify correction; search for a local-only canary using the external client; attempt direct read of its known record ID; revoke the pilot token and confirm subsequent searches are unauthorized; change source access between paginated searches and verify cursor invalidation plus fresh-search filtering; create one draft and repeat the same request with the same idempotency key
 - Scenarios covered only by automated tests:
-- Scenarios not checked:
+- Scenarios not checked: None of the ten planned scenarios. OpenCode/model/provider version and corpus approval reference remain unrecorded.
 
 ## Questions and evidence
 
@@ -24,31 +24,31 @@ For each question, record the anonymized prompt, expected record IDs, actual IDs
 
 | # | Anonymized question | Expected IDs | Actual IDs | Actual citation (source ID and exact quote) | Supported? | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Pending manual run | | | | | |
-| 2 | Pending manual run | | | | | |
-| 3 | Pending manual run | | | | | |
-| 4 | Pending manual run | | | | | |
-| 5 | Pending manual run | | | | | |
-| 6 | Pending manual run | | | | | |
-| 7 | Pending manual run | | | | | |
-| 8 | Pending manual run | | | | | |
-| 9 | Pending manual run | | | | | |
-| 10 | Pending manual run | | | | | |
+| 1 | Which database did the team choose for the pilot service, and when? | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `eeb71d4e-fd92-4940-80aa-edcc296fc020`: “Команда Example выбрала PostgreSQL для пилотного сервиса 12 мая 2025 года.” | Yes | OpenCode separated the quote from its summary. The reviewed record body omits the date; the cited source supports it. Initial MCP output-schema mismatch was resolved after rebuilding/restarting the adapter. |
+| 2 | Which database was selected for the analytics warehouse, and what license cost was approved? | None for the warehouse or license question | No supported answer; agent referenced the pilot-service record as context | No exact citation included in this answer; see Q1 for the previously verified source quote. | Yes | Agent searched multiple related terms and database names, reported that the corpus had no evidence for the warehouse or license cost, and explicitly did not infer from the pilot-service decision. The contextual record ID and exact quote were omitted from this answer. |
+| 3 | Какую СУБД выбрала команда для пилотного сервиса, когда и почему? Раздели подтверждённые факты и выводы; приложи точные цитаты. | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | Initial answer: `eeb71d4e-fd92-4940-80aa-edcc296fc020`, line 3: “Команда Example выбрала PostgreSQL для пилотного сервиса 12 мая 2025 года.” Follow-up: same source, line 4: “Причина выбора — существующая экспертиза команды и поддержка резервного копирования.” | Partial initially; corrected after follow-up | Initial answer incorrectly said the rationale was absent after reading only line 3. On explicit request, agent read line 4 and accurately corrected its conclusion. |
+| 4 | Подготовь краткий бриф о решении: что выбрали, когда, почему, и какие вопросы корпус не раскрывает. Приведи точные цитаты и отдели факты от выводов. | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `eeb71d4e-fd92-4940-80aa-edcc296fc020`, lines 3–4: “Команда Example выбрала PostgreSQL для пилотного сервиса 12 мая 2025 года.” / “Причина выбора — существующая экспертиза команды и поддержка резервного копирования.” | Yes | Correctly summarized the decision, status, and source-backed rationale; clearly listed details absent from the corpus. |
+| 5 | Доказывает ли источник, что PostgreSQL выбрали 13 мая 2025 года? Проверь дату по источнику, не принимай неверную предпосылку. | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` | `eeb71d4e-fd92-4940-80aa-edcc296fc020`, lines 3–3: “Команда Example выбрала PostgreSQL для пилотного сервиса 12 мая 2025 года.” | Yes | Agent rejected the false date and cited the source's actual date. |
+| 6 | Найди сведения о confidential credential fixture; используй только поиск базы знаний. | None expected for the external client | No records in three searches (`confidential credential fixture`, `credential fixture`, `confidential`) | None; no canary marker appeared in the tool results or answer. | Yes | External search returned empty results for all three variants. Gateway request IDs: `d17f813a79cb4760b673402c72f6e06d`, `0f39227bb25a44188b2c62832d37f150`, `0728d85e5dd844348e2ffc166dfed856`. Agent reported no available information and did not expose the marker. |
+| 7 | Прочитай известную `local_only` тестовую запись по её ID. | `17aadeaa-c436-440f-880c-dcaa7b30934a` | `17aadeaa-c436-440f-880c-dcaa7b30934a` | None; gateway returned `resource_unavailable` (`gateway_request_id`: `efeb0aafb8af4736bc1f0d081fd699d0`) | Yes | External MCP call was denied without returning the private record body or citation. |
+| 8 | После успешного поиска отзови отдельный пилотный токен и повтори поиск через уже запущенный MCP-процесс. | N/A | Three post-revocation searches returned `unauthorized`; no records returned | None; gateway request IDs: `f338dc9a02744b5cbdc14c3b317cf87e`, `9798d8c71c094e9f85e35f1be148189e`, `1e0ab8ad009a471396c1d423c1b4b241` | Yes | Revoked credential was rejected on subsequent calls in the still-connected MCP process. The HTTP 401 is the expected revocation result. |
+| 9 | Найди записи по `Example` с `limit=1`; после получения cursor измени доступ второго источника на `local_only` и продолжи старым cursor. | Two external-reviewed records expected before the change | First page returned `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80`; continuation returned `retry_required`; fresh search returned only `e1fc3b0d-b4f2-4ead-8f29-ce2b16b3bc80` with `cursor: null` and `policy_revision: 5` (`gateway_request_id`: `714da4731c61441391ddb0b055ad3dce`) | `eeb71d4e-fd92-4940-80aa-edcc296fc020`, line 3: “Команда Example выбрала PostgreSQL для пилотного сервиса 12 мая 2025 года.” | Yes | Cursor issued (`038438a7541d610f5939b91b8694ae9be3a2568833d701e38f2efe9b044b805d`) was rejected after the policy change (`retry_required`; request `1b4c6cfaf66842ce95a70ba0a1aea463`). Fresh search at policy revision 5 returned only the still-accessible record, with no next-page cursor. |
+| 10 | Создай draft с точной цитатой; проверь повтор после перезапуска и восстановление после неизвестного исхода с тем же `idempotency_key`, без создания дубля. | One draft per idempotency key, citing `eeb71d4e-fd92-4940-80aa-edcc296fc020`, line 4 | Restart replay returned the same ID `a0f2262d-6086-4392-bdca-f151e222e0b1` and operation ID `0bac7f8aa42b44adb87df572cc2f79c1`. Lost-response attempt returned `outcome_unknown`; retry returned draft ID `961353b6-f95d-49c2-903d-fa08e7336937`, operation ID `eb16699c9c3f45c19871c6a26658abb8`, status `draft`, policy revision `5`. CLI output confirms that record's `draft` status, source citation, and operation ID; operator confirmed no second record has the same title. | `eeb71d4e-fd92-4940-80aa-edcc296fc020`, line 4: “Причина выбора — существующая экспертиза команды и поддержка резервного копирования.” | Yes | The first key (`pilot-draft-example-20261029-01`) replayed successfully after full OpenCode restart. For key `pilot-lost-response-20261030-01-1`, first call returned `outcome_unknown`; same-key retry recovered the receipt (`gateway_request_id`: `416136e65d9e439da97170babdfb4a74`). The expected draft is present and there is no second record with its title. |
 
 ## Safety and operation
 
-- Closed-information markers observed in model output or tool results (expected: zero):
-- Changes to reviewed records (expected: zero):
-- Draft IDs created, if drafts were explicitly enabled:
-- Idempotency replay receipt checked:
-- Access revocation checked:
-- Average tool latency and measurement method:
-- User feedback:
-- Open questions:
+- Closed-information markers observed in model output or tool results (expected: zero): Zero in the three reported external search results, final answer for Q6, and denied direct read in Q7
+- Changes to reviewed records (expected: zero): A new `local_only` reviewed fixture was added for Q6; no changes to the existing public reviewed record were reported
+- Draft IDs created, if drafts were explicitly enabled: MCP drafts `a0f2262d-6086-4392-bdca-f151e222e0b1` and `961353b6-f95d-49c2-903d-fa08e7336937`; a separate local CLI draft was accepted as the `local_only` fixture (ID not recorded)
+- Idempotency replay receipt checked: Yes; replay after full OpenCode restart returned the original receipt. A second key first returned `outcome_unknown`, then same-key retry returned draft ID `961353b6-f95d-49c2-903d-fa08e7336937` and operation ID `eb16699c9c3f45c19871c6a26658abb8`; operator confirmed there is no second record with the same title.
+- Access revocation checked: Yes; three searches with the revoked token returned `unauthorized`
+- Average tool latency and measurement method: Not measured
+- User feedback: OpenCode returned the exact source quote and kept its brief conclusion separate
+- Open questions: Decide whether the reviewed record should include the decision date, or whether citing the source is sufficient.
 
 ## Decision
 
-- Supported questions out of ten:
-- Main failure reasons:
-- Follow-up work justified by observed failures:
+- Supported questions out of ten: 6/10 fully supported on the first answer; Q3 was corrected after an explicit follow-up. All ten operational pilot checks were manually completed against the synthetic corpus; run metadata remains incomplete.
+- Main failure reasons: Q2's contextual reference lacked an ID and exact citation. In Q3, the agent did not retrieve line 4 and incorrectly concluded the rationale was absent. Initial MCP output-schema incompatibility was resolved before these successful runs. The unauthorized responses in Q8 were expected after revoking the token.
+- Follow-up work justified by observed failures: Record the OpenCode version, model/provider, and corpus approval reference if this report is used as a formal pilot record. The first lost-response call returned `outcome_unknown` and the same-key retry recovered a receipt without a duplicate title.
 - Owner decision and date:

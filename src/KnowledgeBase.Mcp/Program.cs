@@ -61,7 +61,7 @@ await builder.Build().RunAsync();
 static McpServerTool CreateTool(Delegate handler, string name, string description, string dataSchemaJson, bool readOnly, bool idempotent, JsonSerializerOptions serializerOptions)
 {
     var schemaJson = """
-        {"oneOf":[
+        {"type":"object","oneOf":[
           {"type":"object","properties":{"ok":{"const":true},"data":__DATA_SCHEMA__,"gateway_request_id":{"type":"string"}},"required":["ok","data"],"additionalProperties":false},
           {"type":"object","properties":{"ok":{"const":false},"error":{"type":"object","properties":{"code":{"type":"string"},"retryable":{"type":"boolean"},"outcome_unknown":{"type":"boolean"},"gateway_request_id":{"type":"string"},"idempotency_key":{"type":"string"}},"required":["code","retryable","outcome_unknown"],"additionalProperties":false}},"required":["ok","error"],"additionalProperties":false}
         ]}

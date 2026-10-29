@@ -12,6 +12,8 @@ KB_DATABASE_PATH=/path/to/knowledge-base dotnet run --project src/KnowledgeBase.
 
 The listener binds to `127.0.0.1:8765`. Set `KB_SERVER_PORT` to choose another loopback port. `KB_SERVER_STATE_PATH` selects the cursor key, audit log, and idempotency state directory. `KB_CLIENT_REGISTRY_PATH` selects the credential registry; both paths should be outside the portable database and protected by the owner's filesystem permissions.
 
+Run `kb client create` and `kb client revoke` with the same `KB_CLIENT_REGISTRY_PATH` as the server. If it is unset, both use `clients.json` next to `KB_SERVER_STATE_PATH` (by default `~/.kb/clients.json`). If the server uses a custom state directory, older CLI builds may still use the default registry; update the CLI or set `KB_CLIENT_REGISTRY_PATH` explicitly for both processes. Restart the server after changing its registry path. A token written to a different registry is rejected as `401 unauthorized` even if it was just created.
+
 Back up the database, server state directory, and client registry together while the server is stopped. The state directory contains the cursor key, audit log, and durable draft-operation journal (`idempotency.json`). The registry contains client token hashes. These files are not part of the portable knowledge archive. Restoring only the database or only the server state can lose replay guarantees; keep the matching backup set.
 
 ## Credentials
