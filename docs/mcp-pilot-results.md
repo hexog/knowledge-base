@@ -1,22 +1,21 @@
 # MCP pilot results
 
-Status: **10 of 10 pilot checks completed manually; run metadata incomplete**
+Status: **10 of 10 pilot checks completed manually; latency measurement method not recorded**
 
 Do not invent results. Automated process tests use synthetic data and do not count as a real LLM pilot.
 
 ## Run details
 
-- Commit: `b3ef518` plus uncommitted MCP output-schema change in `src/KnowledgeBase.Mcp/Program.cs`
+- Commit tested: `73cfdbdd806f21dd6d052e96b91951ccd4a02be0`
 - Date: 2026-10-29–2026-10-30
-- OpenCode version:
+- OpenCode version: `v2.2.0`
 - MCP SDK version: `ModelContextProtocol 2.3.0`
-- Model/provider:
-- Gateway profile and scopes: Not recorded; search and source-read calls succeeded
-- Corpus and approval reference: Synthetic test corpus at `/tmp/kb_test`; approval reference not recorded
-- Human operator: Manual OpenCode run; name not recorded
+- Model/provider: DeepSeek R1; OpenCode provider label not separately recorded
+- Gateway profile and scopes: All credentials used `external`; four read-pilot credentials had `search,read` scopes (one was revoked after testing); the draft credential had `search,read,draft`. Token hashes and IDs are omitted.
+- Corpus and approval reference: Synthetic local test corpus at `/tmp/kb_test`; separate approval was not required
 - Scenarios completed by a person: Search for the PostgreSQL decision; read the record and verify the exact source quote (lines 3–3); ask about a subject absent from the corpus and check abstention; ask for decision date and rationale, then explicitly read the omitted source line 4; prepare an evidence-based brief with source gaps; challenge the source with a false date and verify correction; search for a local-only canary using the external client; attempt direct read of its known record ID; revoke the pilot token and confirm subsequent searches are unauthorized; change source access between paginated searches and verify cursor invalidation plus fresh-search filtering; create one draft and repeat the same request with the same idempotency key
-- Scenarios covered only by automated tests:
-- Scenarios not checked: None of the ten planned scenarios. OpenCode/model/provider version and corpus approval reference remain unrecorded.
+- Scenarios covered only by automated tests: SDK-driven stdio process integration against a loopback gateway and temporary file database; closed input/output schemas; default hiding of `draft_record` and no gateway request for an unregistered call; search/record/source reads and scope denial; draft enablement, same-key replay after MCP restart, key-conflict rejection, and revocation; absence of token, query, citation, body, and idempotency key in stderr. Protocol safety tests cover response-body deadlines and cancellation, malformed/missing gateway fields, and exact serialized MCP-result size limits.
+- Scenarios not checked: None of the ten planned scenarios.
 
 ## Questions and evidence
 
@@ -42,13 +41,13 @@ For each question, record the anonymized prompt, expected record IDs, actual IDs
 - Draft IDs created, if drafts were explicitly enabled: MCP drafts `a0f2262d-6086-4392-bdca-f151e222e0b1` and `961353b6-f95d-49c2-903d-fa08e7336937`; a separate local CLI draft was accepted as the `local_only` fixture (ID not recorded)
 - Idempotency replay receipt checked: Yes; replay after full OpenCode restart returned the original receipt. A second key first returned `outcome_unknown`, then same-key retry returned draft ID `961353b6-f95d-49c2-903d-fa08e7336937` and operation ID `eb16699c9c3f45c19871c6a26658abb8`; operator confirmed there is no second record with the same title.
 - Access revocation checked: Yes; three searches with the revoked token returned `unauthorized`
-- Average tool latency and measurement method: Not measured
+- Average tool latency and measurement method: Reported as `<0.5 s`; measurement method and sample count not recorded
 - User feedback: OpenCode returned the exact source quote and kept its brief conclusion separate
-- Open questions: Decide whether the reviewed record should include the decision date, or whether citing the source is sufficient.
+- Open questions: None. The reviewed record body remains unchanged; the source citation carries the decision date.
 
 ## Decision
 
-- Supported questions out of ten: 6/10 fully supported on the first answer; Q3 was corrected after an explicit follow-up. All ten operational pilot checks were manually completed against the synthetic corpus; run metadata remains incomplete.
+- Supported questions out of ten: 6/10 fully supported on the first answer; Q3 was corrected after an explicit follow-up. All ten operational pilot checks were manually completed against the synthetic corpus.
 - Main failure reasons: Q2's contextual reference lacked an ID and exact citation. In Q3, the agent did not retrieve line 4 and incorrectly concluded the rationale was absent. Initial MCP output-schema incompatibility was resolved before these successful runs. The unauthorized responses in Q8 were expected after revoking the token.
-- Follow-up work justified by observed failures: Record the OpenCode version, model/provider, and corpus approval reference if this report is used as a formal pilot record. The first lost-response call returned `outcome_unknown` and the same-key retry recovered a receipt without a duplicate title.
-- Owner decision and date:
+- Follow-up work justified by observed failures: For a subsequent pilot using real knowledge, obtain a separately approved corpus. The first lost-response call returned `outcome_unknown` and the same-key retry recovered a receipt without a duplicate title.
+- Owner decision: Accept the results of the synthetic pilot. Keep the reviewed record body unchanged; use the source citation for the decision date. Run a pilot on a real corpus only after that corpus is separately approved.
