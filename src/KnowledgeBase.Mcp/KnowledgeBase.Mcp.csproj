@@ -11,6 +11,9 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="../KnowledgeBase.Configuration/KnowledgeBase.Configuration.csproj" />
+  </ItemGroup>
+  <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
       <_Parameter1>KnowledgeBase.Tests</_Parameter1>
     </AssemblyAttribute>

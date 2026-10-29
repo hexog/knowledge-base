@@ -23,7 +23,7 @@ Use the existing environment variable names as JSON property names. For example:
 }
 ```
 
-The JSON file may contain a gateway token. Keep it outside the repository and restrict read access to the account that runs the applications (for example, `chmod 600 ~/.kb/appsettings.json` on Unix-like systems). Prefer the environment or the operating system's protected secret store when that better fits the deployment.
+The JSON file may contain a gateway token. Keep it outside the repository and restrict read access to the account that runs the applications (for example, `chmod 600 ~/.kb/appsettings.json` on Unix-like systems). At startup, applications warn on Unix-like systems if group or other users have any permissions on this file; they do not change permissions or prevent startup. On Windows, protect the file with the account's ACL. Prefer the environment or the operating system's protected secret store when that better fits the deployment.
 
 `KB_HOME` is the CLI's default database path. `KB_DATABASE_PATH` is required by the server. If unset, server state defaults to `~/.kb/server`, and the client registry defaults to `clients.json` beside the state directory. The server listens on loopback port `8765` unless `KB_SERVER_PORT` is set.
 

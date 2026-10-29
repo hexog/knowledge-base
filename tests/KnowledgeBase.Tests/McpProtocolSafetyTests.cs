@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using KnowledgeBase.Mcp;
+using KnowledgeBase.Configuration;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using Xunit;

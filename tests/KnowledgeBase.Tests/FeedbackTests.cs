@@ -2,6 +2,8 @@ using System.Text;
 using System.Diagnostics;
 using System.Text.Json;
 using KnowledgeBase.Core;
+using KnowledgeBase.Configuration;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace KnowledgeBase.Tests;
@@ -150,6 +152,32 @@ public sealed class FeedbackTests : IDisposable
             Assert.Equal("8765", configuration["KB_SERVER_PORT"]);
         }
         finally { Environment.SetEnvironmentVariable("KB_HOME", original); }
+    }
+
+    [Fact]
+    public void TypedApplicationSettingsApplyDefaultsAndRejectInvalidValues()
+    {
+        var path = Path.Combine(temp, "settings.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(new { KB_DATABASE_PATH = Db }));
+        var configuration = ApplicationConfiguration.Load(path);
+        var server = ServerSettings.Load(configuration);
+        Assert.Equal(8765, server.Port);
+        Assert.Equal(Path.Combine(Path.GetDirectoryName(server.StatePath)!, "clients.json"), server.ClientRegistryPath);
+        File.WriteAllText(path, JsonSerializer.Serialize(new { KB_DATABASE_PATH = Db, KB_SERVER_PORT = "not-a-port" }));
+        Assert.Throws<InvalidOperationException>(() => ServerSettings.Load(ApplicationConfiguration.Load(path)));
+        File.WriteAllText(path, "{\"KB_SERVER_PORT\":\"8765\"}");
+        Assert.Throws<InvalidOperationException>(() => ServerSettings.Load(ApplicationConfiguration.Load(path)));
+    }
+
+    [Fact]
+    public void ConfigurationWarnsForUnixPermissionsSharedWithOtherUsers()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var path = Path.Combine(temp, "private-settings.json"); File.WriteAllText(path, "{}");
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+        Assert.Contains("accessible to group or other users", ApplicationConfiguration.GetPermissionWarning(path));
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        Assert.Null(ApplicationConfiguration.GetPermissionWarning(path));
     }
 
     private (int ExitCode, string Stdout, string Stderr) RunCli(params string[] arguments)

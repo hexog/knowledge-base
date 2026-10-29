@@ -3,12 +3,14 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using KnowledgeBase.Configuration;
 using KnowledgeBase.Core;
 
 var configuration = ApplicationConfiguration.Load();
-var database = configuration["KB_DATABASE_PATH"] ?? throw new InvalidOperationException("Set KB_DATABASE_PATH in ~/.kb/appsettings.json or the environment");
-var state = Path.GetFullPath(configuration["KB_SERVER_STATE_PATH"] ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "server"));
-var registryPath = configuration["KB_CLIENT_REGISTRY_PATH"] ?? Path.Combine(Path.GetDirectoryName(state)!, "clients.json");
+var settings = ServerSettings.Load(configuration);
+var database = settings.DatabasePath;
+var state = settings.StatePath;
+var registryPath = settings.ClientRegistryPath;
 Directory.CreateDirectory(state);
 using var processLock = AcquireServerLock(Path.Combine(state, ".server.lock"));
 var store = new KnowledgeBaseStore(database); store.Initialize();
@@ -22,7 +24,7 @@ var service = new AgentKnowledgeService(store, File.ReadAllBytes(cursorKeyPath))
 var clients = new ClientRegistry(registryPath); var audit = new AuditWriter(state); var idempotency = new IdempotencyStore(state);
 var requestGate = new SemaphoreSlim(8, 8); var queued = 0;
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.ConfigureKestrel(options => { options.Listen(System.Net.IPAddress.Loopback, int.TryParse(configuration["KB_SERVER_PORT"], out var port) ? port : 8765); options.Limits.MaxRequestBodySize = 1024 * 1024; });
+builder.WebHost.ConfigureKestrel(options => { options.Listen(System.Net.IPAddress.Loopback, settings.Port); options.Limits.MaxRequestBodySize = 1024 * 1024; });
 var app = builder.Build();
 app.Use(async (context, next) =>
 {

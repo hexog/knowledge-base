@@ -1,31 +1,10 @@
-using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Extensions.Configuration;
+using KnowledgeBase.Configuration;
 using ModelContextProtocol;
 
 namespace KnowledgeBase.Mcp;
-
-internal sealed record McpSettings(Uri GatewayUrl, string Token, bool EnableDrafts, int TimeoutSeconds)
-{
-    public static McpSettings Load(IConfiguration configuration)
-    {
-        var rawUrl = configuration["KB_MCP_GATEWAY_URL"];
-        var token = configuration["KB_MCP_GATEWAY_TOKEN"];
-        if (!Uri.TryCreate(rawUrl, UriKind.Absolute, out var url) || url.Scheme != Uri.UriSchemeHttp ||
-            !IPAddress.TryParse(url.Host, out var address) || !IPAddress.IsLoopback(address) ||
-            url.UserInfo.Length != 0 || url.Query.Length != 0 || url.Fragment.Length != 0 || url.AbsolutePath is not ("/" or ""))
-            throw new InvalidOperationException("KB_MCP_GATEWAY_URL must be an HTTP URL with a numeric loopback address and no path, query, fragment, or userinfo.");
-        if (string.IsNullOrWhiteSpace(token)) throw new InvalidOperationException("KB_MCP_GATEWAY_TOKEN is required.");
-        var timeoutText = configuration["KB_MCP_HTTP_TIMEOUT_SECONDS"];
-        var timeout = string.IsNullOrEmpty(timeoutText) ? 15 : int.TryParse(timeoutText, out var parsed) ? parsed : 0;
-        if (timeout is < 1 or > 300) throw new InvalidOperationException("KB_MCP_HTTP_TIMEOUT_SECONDS must be between 1 and 300.");
-        var draftsText = configuration["KB_MCP_ENABLE_DRAFTS"];
-        if (!string.IsNullOrEmpty(draftsText) && !bool.TryParse(draftsText, out _)) throw new InvalidOperationException("KB_MCP_ENABLE_DRAFTS must be true or false.");
-        return new(url, token, string.Equals(draftsText, "true", StringComparison.OrdinalIgnoreCase), timeout);
-    }
-}
 
 internal sealed class GatewayClient : IDisposable
 {
