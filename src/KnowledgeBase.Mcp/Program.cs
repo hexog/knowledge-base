@@ -5,11 +5,14 @@ using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.AI;
 using ModelContextProtocol.Protocol;
 
-var settings = McpSettings.Load();
 var builder = Host.CreateApplicationBuilder(args);
+var settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "appsettings.json");
+var configuration = new ConfigurationBuilder().AddJsonFile(settingsPath, optional: true, reloadOnChange: false).AddEnvironmentVariables().Build();
+var settings = McpSettings.Load(configuration);
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 var gateway = new GatewayClient(settings);

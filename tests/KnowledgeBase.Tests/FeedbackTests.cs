@@ -136,6 +136,22 @@ public sealed class FeedbackTests : IDisposable
         Assert.True(JsonDocument.Parse(invalid.Stdout).RootElement.TryGetProperty("error", out _));
     }
 
+    [Fact]
+    public void ApplicationConfigurationLoadsJsonAndEnvironmentOverridesIt()
+    {
+        var path = Path.Combine(temp, "appsettings.json");
+        File.WriteAllText(path, "{\"KB_HOME\":\"from-json\",\"KB_SERVER_PORT\":\"8765\"}");
+        var original = Environment.GetEnvironmentVariable("KB_HOME");
+        try
+        {
+            Environment.SetEnvironmentVariable("KB_HOME", "from-environment");
+            var configuration = ApplicationConfiguration.Load(path);
+            Assert.Equal("from-environment", configuration["KB_HOME"]);
+            Assert.Equal("8765", configuration["KB_SERVER_PORT"]);
+        }
+        finally { Environment.SetEnvironmentVariable("KB_HOME", original); }
+    }
+
     private (int ExitCode, string Stdout, string Stderr) RunCli(params string[] arguments)
     {
         var assembly = Path.Combine(AppContext.BaseDirectory, "KnowledgeBase.Cli.dll");

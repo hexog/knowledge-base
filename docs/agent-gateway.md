@@ -1,6 +1,6 @@
 # Agent gateway MVP
 
-The gateway is a separate loopback-only HTTP process. It reads the same file database as `kb`; do not give an agent direct filesystem access to the database, server state, or client registry. Run only one server process for a given server state directory. A process lock rejects a second server using that state. Do not point multiple state directories at one database.
+The gateway is a separate loopback-only HTTP process. It reads the same file database as `kb`; do not give an agent direct filesystem access to the database, server state, or client registry. Run only one server process for a given server state directory. A process lock rejects a second server using that state. Do not point multiple state directories at one database. Applications read shared JSON and environment settings as described in [Application configuration](application-configuration.md).
 
 ## Prepare and start
 

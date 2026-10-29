@@ -6,7 +6,7 @@
 
 Follow [Agent gateway MVP](agent-gateway.md) to migrate the database, start the gateway, and issue a client credential. For the first pilot, use an `external` credential with `search,read` scopes. Keep drafts disabled until the read-only pilot is complete. A draft-enabled run needs an explicitly enabled adapter and a separate credential with the `draft` scope.
 
-Set the adapter environment in the shell or the operating system's protected environment store. Do not put the token itself in an OpenCode project configuration file, command-line argument, or repository file:
+Set the adapter settings in `~/.kb/appsettings.json` or the shell/environment store. The shared config file can contain the token if it is protected with owner-only permissions; environment values override the file. Do not put the token in an OpenCode project configuration file, command-line argument, or repository file. See [Application configuration](application-configuration.md) for the JSON form.
 
 ```sh
 export KB_MCP_GATEWAY_URL=http://127.0.0.1:8765

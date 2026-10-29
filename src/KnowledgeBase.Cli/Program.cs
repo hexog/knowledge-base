@@ -4,9 +4,11 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text;
 using System.Security.Cryptography;
+using Microsoft.Extensions.Configuration;
 using KnowledgeBase.Core;
 
-var defaultDatabase = Environment.GetEnvironmentVariable("KB_HOME")
+var applicationConfiguration = ApplicationConfiguration.Load();
+var defaultDatabase = applicationConfiguration["KB_HOME"]
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".knowledge-base");
 var databaseOption = new Option<string>("--db") { Description = "Knowledge-base directory", DefaultValueFactory = _ => defaultDatabase };
 var jsonOption = new Option<bool>("--json") { Description = "Write machine-readable JSON" };
@@ -101,13 +103,13 @@ var clients = new Command("client", "Manage agent API clients"); var profileOpti
 var clientCreate = new Command("create", "Create a bearer credential (shown once)"); clientCreate.Options.Add(profileOption); clientCreate.Options.Add(scopesOption);
 clientCreate.SetAction(parse => Run<object>(() =>
 {
-    var issued = new ClientRegistry(GetClientRegistryPath()).Create(parse.GetValue(profileOption)!, parse.GetValue(scopesOption)!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    var issued = new ClientRegistry(GetClientRegistryPath(applicationConfiguration)).Create(parse.GetValue(profileOption)!, parse.GetValue(scopesOption)!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
     return issued;
 }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 var clientRevoke = new Command("revoke", "Revoke an agent API client"); var clientId = new Argument<string>("client-id"); clientRevoke.Arguments.Add(clientId);
 clientRevoke.SetAction(parse => Run<object>(() =>
 {
-    if (!new ClientRegistry(GetClientRegistryPath()).Revoke(parse.GetValue(clientId)!)) throw new FileNotFoundException("Client not found"); return new { revoked = true };
+    if (!new ClientRegistry(GetClientRegistryPath(applicationConfiguration)).Revoke(parse.GetValue(clientId)!)) throw new FileNotFoundException("Client not found"); return new { revoked = true };
 }, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 clients.Subcommands.Add(clientCreate); clients.Subcommands.Add(clientRevoke);
 
@@ -118,7 +120,7 @@ var draftBody = new Option<string>("--body") { DefaultValueFactory = _ => "<!-- 
 var draftType = new Option<string>("--type") { DefaultValueFactory = _ => "fact" }; var draftKind = new Option<string>("--kind") { DefaultValueFactory = _ => "source_claim" };
 var draftStartLine = new Option<int>("--start-line") { Required = true }; var draftEndLine = new Option<int>("--end-line") { Required = true }; var draftQuote = new Option<string>("--quote") { Required = true };
 draft.Options.Add(draftSource); draft.Options.Add(draftTitle); draft.Options.Add(draftBody); draft.Options.Add(draftType); draft.Options.Add(draftKind); draft.Options.Add(draftStartLine); draft.Options.Add(draftEndLine); draft.Options.Add(draftQuote);
-draft.SetAction(parse => Run(() => CreateManualDraft(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(draftSource), parse.GetValue(draftTitle)!, parse.GetValue(draftBody)!, parse.GetValue(draftType)!, parse.GetValue(draftKind)!, parse.GetValue(draftStartLine), parse.GetValue(draftEndLine), parse.GetValue(draftQuote)!), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+draft.SetAction(parse => Run(() => CreateManualDraft(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(draftSource), parse.GetValue(draftTitle)!, parse.GetValue(draftBody)!, parse.GetValue(draftType)!, parse.GetValue(draftKind)!, parse.GetValue(draftStartLine), parse.GetValue(draftEndLine), parse.GetValue(draftQuote)!, applicationConfiguration), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 var recordStatus = new Option<string?>("--status"); var listRecords = new Command("list", "List knowledge records"); listRecords.Options.Add(recordStatus);
 listRecords.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).ListRecords(parse.GetValue(recordStatus)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 var recordId = new Argument<Guid>("record-id"); var sourcesOption = new Option<bool>("--sources"); var showRecord = new Command("show", "Show a knowledge record"); showRecord.Arguments.Add(recordId); showRecord.Options.Add(sourcesOption);
@@ -127,7 +129,7 @@ var editRecord = new Command("edit", "Edit a knowledge record in the configured 
 editRecord.SetAction(parse => Run<object>(() =>
 {
     var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!); var current = store.ShowRecord(parse.GetValue(recordId));
-    var editor = Environment.GetEnvironmentVariable("VISUAL") ?? Environment.GetEnvironmentVariable("EDITOR");
+    var editor = applicationConfiguration["VISUAL"] ?? applicationConfiguration["EDITOR"];
     if (string.IsNullOrWhiteSpace(editor)) return new { path = current.Path, message = "Set VISUAL or EDITOR to edit this draft" };
     using var temp = new TemporaryEditFile(current.Path); var expectedHash = KnowledgeRepository.FileHash(File.ReadAllText(current.Path)); var commandParts = editor.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
     var start = new System.Diagnostics.ProcessStartInfo(commandParts[0]) { UseShellExecute = false };
@@ -178,7 +180,7 @@ feedbackSetStatus.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetV
 feedbackCommand.Subcommands.Add(feedbackAdd); feedbackCommand.Subcommands.Add(feedbackList); feedbackCommand.Subcommands.Add(feedbackShow); feedbackCommand.Subcommands.Add(feedbackSetStatus);
 
 var extract = new Command("extract", "Create draft suggestions with an explicitly configured local process"); var extractSource = new Option<Guid>("--source") { Required = true }; extract.Options.Add(extractSource);
-extract.SetAction(parse => Run(() => InvokeLocalExtractor(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(extractSource)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+extract.SetAction(parse => Run(() => InvokeLocalExtractor(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(extractSource), applicationConfiguration), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
 root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(feedbackCommand); root.Subcommands.Add(extract);
 var parseResult = root.Parse(args);
@@ -229,12 +231,12 @@ static JsonSerializerOptions CreateJsonOutputOptions() => new()
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
 };
 
-static string GetClientRegistryPath()
+static string GetClientRegistryPath(IConfiguration configuration)
 {
-    var explicitPath = Environment.GetEnvironmentVariable("KB_CLIENT_REGISTRY_PATH");
+    var explicitPath = configuration["KB_CLIENT_REGISTRY_PATH"];
     if (!string.IsNullOrWhiteSpace(explicitPath)) return explicitPath;
 
-    var statePath = Environment.GetEnvironmentVariable("KB_SERVER_STATE_PATH")
+    var statePath = configuration["KB_SERVER_STATE_PATH"]
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kb", "server");
     return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(statePath))!, "clients.json");
 }
@@ -301,9 +303,9 @@ static DateTimeOffset? ParseDate(string? value, string option, bool inclusiveDat
     throw new ArgumentException($"Invalid date for {option}: expected YYYY-MM-DD or ISO 8601 timestamp");
 }
 
-static object InvokeLocalExtractor(KnowledgeBaseStore store, Guid sourceId)
+static object InvokeLocalExtractor(KnowledgeBaseStore store, Guid sourceId, IConfiguration configuration)
 {
-    var executable = Environment.GetEnvironmentVariable("KB_LOCAL_EXTRACTOR_EXECUTABLE");
+    var executable = configuration["KB_LOCAL_EXTRACTOR_EXECUTABLE"];
     if (string.IsNullOrWhiteSpace(executable)) throw new InvalidOperationException("Set KB_LOCAL_EXTRACTOR_EXECUTABLE and optionally KB_LOCAL_EXTRACTOR_ARGUMENTS (a JSON string array) to explicitly configure a local extractor");
     var (record, directory) = store.Show(sourceId); var textPath = Path.Combine(directory, "extracted.txt");
     if (!File.Exists(textPath)) throw new InvalidDataException($"Source {sourceId}: extracted text is unavailable");
@@ -312,14 +314,14 @@ static object InvokeLocalExtractor(KnowledgeBaseStore store, Guid sourceId)
     if (record.ExtractedTextSha256 is null || !string.Equals(actualTextHash, record.ExtractedTextSha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Source {sourceId}: extracted text changed; reimport or repair the source before extraction");
     if (Encoding.UTF8.GetByteCount(text) > 10 * 1024 * 1024) throw new InvalidDataException("Local extractor input exceeds 10 MiB");
     var start = new System.Diagnostics.ProcessStartInfo(executable) { UseShellExecute = false };
-    var configuredArgs = Environment.GetEnvironmentVariable("KB_LOCAL_EXTRACTOR_ARGUMENTS");
+    var configuredArgs = configuration["KB_LOCAL_EXTRACTOR_ARGUMENTS"];
     if (!string.IsNullOrWhiteSpace(configuredArgs))
     {
         var args = JsonSerializer.Deserialize<string[]>(configuredArgs) ?? throw new InvalidDataException("KB_LOCAL_EXTRACTOR_ARGUMENTS must be a JSON array of strings");
         foreach (var arg in args) start.ArgumentList.Add(arg);
     }
     var request = new { schema_version = "1", operation_id = Guid.NewGuid(), source_id = sourceId, text_sha256 = record.ExtractedTextSha256, text };
-    var modelVersion = Environment.GetEnvironmentVariable("KB_LOCAL_EXTRACTOR_MODEL_VERSION");
+    var modelVersion = configuration["KB_LOCAL_EXTRACTOR_MODEL_VERSION"];
     using var cancellation = new CancellationTokenSource();
     ConsoleCancelEventHandler cancelHandler = (_, eventArgs) => { eventArgs.Cancel = true; cancellation.Cancel(); };
     Console.CancelKeyPress += cancelHandler;
@@ -365,10 +367,10 @@ static object InvokeLocalExtractor(KnowledgeBaseStore store, Guid sourceId)
     return new { operation_id = request.operation_id, adapter_version = "local-process-v1", model_version = modelVersion, source_id = sourceId, source_text_sha256 = record.ExtractedTextSha256, created, possible_duplicates = duplicates, errors, adapter_stderr = Encoding.UTF8.GetString(stderr) };
 }
 
-static object CreateManualDraft(KnowledgeBaseStore store, Guid sourceId, string title, string body, string type, string kind, int startLine, int endLine, string quote)
+static object CreateManualDraft(KnowledgeBaseStore store, Guid sourceId, string title, string body, string type, string kind, int startLine, int endLine, string quote, IConfiguration configuration)
 {
     var record = store.DraftCandidate(sourceId, title, body, startLine, endLine, quote, type, kind);
-    var editor = Environment.GetEnvironmentVariable("VISUAL") ?? Environment.GetEnvironmentVariable("EDITOR");
+    var editor = configuration["VISUAL"] ?? configuration["EDITOR"];
     if (string.IsNullOrWhiteSpace(editor)) return new { record, path = record.Path, message = "Set VISUAL or EDITOR to edit this draft" };
     var originalHash = KnowledgeRepository.FileHash(File.ReadAllText(record.Path)); using var temp = new TemporaryEditFile(record.Path); var commandParts = editor.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
     var start = new System.Diagnostics.ProcessStartInfo(commandParts[0]) { UseShellExecute = false };

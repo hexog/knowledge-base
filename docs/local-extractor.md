@@ -2,7 +2,7 @@
 
 The `kb extract --source <uuid>` command does not start an extractor unless it is configured explicitly.
 
-Configure the executable and each argument separately:
+Configure the executable and argument array in `~/.kb/appsettings.json` or the environment. Environment values override the JSON file. See [Application configuration](application-configuration.md) for the JSON form. The executable and each argument remain separate settings:
 
 ```sh
 export KB_LOCAL_EXTRACTOR_EXECUTABLE=/path/to/extractor
