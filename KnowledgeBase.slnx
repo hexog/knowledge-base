@@ -2,6 +2,7 @@
   <Project Path="src/KnowledgeBase.Core/KnowledgeBase.Core.csproj" />
   <Project Path="src/KnowledgeBase.Cli/KnowledgeBase.Cli.csproj" />
   <Project Path="src/KnowledgeBase.Server/KnowledgeBase.Server.csproj" />
+  <Project Path="src/KnowledgeBase.Mcp/KnowledgeBase.Mcp.csproj" />
   <Project Path="tests/KnowledgeBase.Tests/KnowledgeBase.Tests.csproj" />
   <Project Path="tests/ExtractorTestProcess/ExtractorTestProcess.csproj" />
 </Solution>
