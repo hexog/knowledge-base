@@ -143,10 +143,44 @@ var reason = new Option<string>("--reason") { Required = true }; var reject = ne
 reject.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).RejectRecord(parse.GetValue(recordId), parse.GetValue(reason)!), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 recordsCommand.Subcommands.Add(draft); recordsCommand.Subcommands.Add(listRecords); recordsCommand.Subcommands.Add(showRecord); recordsCommand.Subcommands.Add(editRecord); recordsCommand.Subcommands.Add(accept); recordsCommand.Subcommands.Add(reject);
 
+var feedbackCommand = new Command("feedback", "Manage the local feedback journal");
+var feedbackAdd = new Command("add", "Save feedback from a local file");
+var feedbackWorkflow = new Option<string>("--workflow") { Required = true };
+var feedbackRating = new Option<string>("--rating") { Required = true };
+var feedbackCategory = new Option<string>("--category") { Required = true };
+var feedbackNoteFile = new Option<string>("--note-file") { Required = true };
+var feedbackExpectedFile = new Option<string?>("--expected-file");
+var feedbackRecord = new Option<Guid?>("--record"); var feedbackSource = new Option<Guid?>("--source");
+var feedbackRequestId = new Option<string?>("--request-id"); var feedbackClient = new Option<string?>("--client"); var feedbackModel = new Option<string?>("--model");
+feedbackAdd.Options.Add(feedbackWorkflow); feedbackAdd.Options.Add(feedbackRating); feedbackAdd.Options.Add(feedbackCategory); feedbackAdd.Options.Add(feedbackNoteFile);
+feedbackAdd.Options.Add(feedbackExpectedFile); feedbackAdd.Options.Add(feedbackRecord); feedbackAdd.Options.Add(feedbackSource); feedbackAdd.Options.Add(feedbackRequestId); feedbackAdd.Options.Add(feedbackClient); feedbackAdd.Options.Add(feedbackModel);
+feedbackAdd.SetAction(parse => Run(() =>
+{
+    var store = new KnowledgeBaseStore(parse.GetValue(databaseOption)!);
+    var notePath = parse.GetValue(feedbackNoteFile)!;
+    if (!File.Exists(notePath)) throw new FileNotFoundException("Feedback note file does not exist", notePath);
+    var expectedPath = parse.GetValue(feedbackExpectedFile);
+    if (expectedPath is not null && !File.Exists(expectedPath)) throw new FileNotFoundException("Expected-result file does not exist", expectedPath);
+    var result = store.Feedback.Add(parse.GetValue(feedbackWorkflow)!, parse.GetValue(feedbackRating)!, parse.GetValue(feedbackCategory)!, File.ReadAllText(notePath, Encoding.UTF8),
+        expectedPath is null ? null : File.ReadAllText(expectedPath, Encoding.UTF8), parse.GetValue(feedbackRecord), parse.GetValue(feedbackSource), parse.GetValue(feedbackRequestId), parse.GetValue(feedbackClient), parse.GetValue(feedbackModel));
+    foreach (var id in result.MissingRecords) Console.Error.WriteLine($"Warning: record {id} is not available in this knowledge base; feedback reference was kept.");
+    foreach (var id in result.MissingSources) Console.Error.WriteLine($"Warning: source {id} is not available in this knowledge base; feedback reference was kept.");
+    return result;
+}, parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+
+var feedbackStatusFilter = new Option<string?>("--status"); var feedbackList = new Command("list", "List local feedback"); feedbackList.Options.Add(feedbackStatusFilter);
+feedbackList.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Feedback.List(parse.GetValue(feedbackStatusFilter)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var feedbackId = new Argument<Guid>("id"); var feedbackShow = new Command("show", "Show local feedback"); feedbackShow.Arguments.Add(feedbackId);
+feedbackShow.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Feedback.Show(parse.GetValue(feedbackId)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+var feedbackSetStatus = new Command("set-status", "Change local feedback status"); var feedbackNewStatus = new Option<string>("--status") { Required = true }; var feedbackReason = new Option<string>("--reason") { Required = true };
+feedbackSetStatus.Arguments.Add(feedbackId); feedbackSetStatus.Options.Add(feedbackNewStatus); feedbackSetStatus.Options.Add(feedbackReason);
+feedbackSetStatus.SetAction(parse => Run(() => new KnowledgeBaseStore(parse.GetValue(databaseOption)!).Feedback.SetStatus(parse.GetValue(feedbackId), parse.GetValue(feedbackNewStatus)!, parse.GetValue(feedbackReason)!), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
+feedbackCommand.Subcommands.Add(feedbackAdd); feedbackCommand.Subcommands.Add(feedbackList); feedbackCommand.Subcommands.Add(feedbackShow); feedbackCommand.Subcommands.Add(feedbackSetStatus);
+
 var extract = new Command("extract", "Create draft suggestions with an explicitly configured local process"); var extractSource = new Option<Guid>("--source") { Required = true }; extract.Options.Add(extractSource);
 extract.SetAction(parse => Run(() => InvokeLocalExtractor(new KnowledgeBaseStore(parse.GetValue(databaseOption)!), parse.GetValue(extractSource)), parse.GetValue(jsonOption), parse.GetValue(verboseOption)));
 
-root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(extract);
+root.Subcommands.Add(init); root.Subcommands.Add(import); root.Subcommands.Add(search); root.Subcommands.Add(show); root.Subcommands.Add(status); root.Subcommands.Add(rebuild); root.Subcommands.Add(migrate); root.Subcommands.Add(access); root.Subcommands.Add(clients); root.Subcommands.Add(recordsCommand); root.Subcommands.Add(feedbackCommand); root.Subcommands.Add(extract);
 var parseResult = root.Parse(args);
 var jsonRequested = args.Contains("--json", StringComparer.Ordinal);
 if (parseResult.Errors.Count > 0)
@@ -209,6 +243,14 @@ static void PrintHuman<T>(T result)
 {
     switch (result)
     {
+        case FeedbackAddResult added:
+            Console.WriteLine($"Feedback saved: {added.Feedback.Id} ({added.Feedback.Status})");
+            break;
+        case FeedbackRecord feedback: Console.WriteLine($"{feedback.Id}  {feedback.Status}  {feedback.Workflow}  {feedback.Rating}/{feedback.Category}\n  {feedback.Note}"); break;
+        case IReadOnlyList<FeedbackRecord> feedbackItems:
+            if (feedbackItems.Count == 0) Console.WriteLine("No feedback.");
+            foreach (var item in feedbackItems) Console.WriteLine($"{item.Id}  {item.CreatedAt:u}  {item.Status}  {item.Workflow}  {item.Rating}/{item.Category}\n  {item.Note}");
+            break;
         case ImportSummary s:
             Console.WriteLine($"Import: {s.Imported} imported, {s.Duplicates} duplicates, {s.Indexed} indexed, {s.Unsupported} unsupported, {s.Errors} errors, {s.Oversized} oversized, {s.SkippedSymlinks} symlinks skipped.");
             foreach (var item in s.Items.Where(x => x.Message is not null || x.Status is "unsupported" or "empty_text"))

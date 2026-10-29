@@ -33,6 +33,8 @@ public sealed class McpProcessTests : IDisposable
     {
         var store = new KnowledgeBaseStore(database);
         store.Initialize();
+        const string privateFeedbackMarker = "feedback-private-mcp-marker";
+        store.Feedback.Add("other", "useful", "positive", privateFeedbackMarker);
         var sourcePath = Path.Combine(temp, "evidence.txt");
         File.WriteAllText(sourcePath, "MCP public evidence citation.\nSecond line.");
         var sourceId = store.Import(sourcePath).Items.Single().SourceId!.Value;
@@ -78,6 +80,9 @@ public sealed class McpProcessTests : IDisposable
             Assert.Contains("gateway_request_id", json);
             Assert.Single(result.Content);
             Assert.Equal(json, Assert.IsType<TextContentBlock>(result.Content[0]).Text);
+
+            var feedbackSearch = await client.CallToolAsync("search", new Dictionary<string, object?> { ["query"] = privateFeedbackMarker });
+            Assert.DoesNotContain(privateFeedbackMarker, JsonSerializer.Serialize(feedbackSearch.StructuredContent));
 
             var source = await client.CallToolAsync("get_source_text", new Dictionary<string, object?>
             {

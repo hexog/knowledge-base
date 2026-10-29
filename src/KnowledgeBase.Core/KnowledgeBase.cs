@@ -316,13 +316,17 @@ public sealed class KnowledgeBaseStore
     private readonly ISearchIndex index;
     private readonly ITextExtractor[] extractors;
     private readonly KnowledgeRepository knowledge;
+    public FeedbackRepository Feedback { get; }
     private string SettingsPath => Path.Combine(root, "config", "settings.json");
     public KnowledgeBaseStore(string path, IEnumerable<ITextExtractor>? textExtractors = null, ISearchIndex? searchIndex = null)
     {
         root = Path.GetFullPath(path); repository = new(root); index = searchIndex ?? new SearchIndex(root);
         extractors = (textExtractors ?? new ITextExtractor[] { new PdfTextExtractor(), new Utf8TextExtractor() }).ToArray();
         knowledge = new KnowledgeRepository(root, Show, _ => AcquireLock());
+        Feedback = new FeedbackRepository(root, () => AcquireLock(), RecordExists, SourceExists);
     }
+    private bool RecordExists(Guid id) { try { knowledge.Show(id); return true; } catch (FileNotFoundException) { return false; } }
+    private bool SourceExists(Guid id) { try { Show(id); return true; } catch (FileNotFoundException) { return false; } }
     public void Initialize()
     {
         Directory.CreateDirectory(repository.SourcesPath); Directory.CreateDirectory(Path.Combine(root, "index")); Directory.CreateDirectory(Path.Combine(root, "config"));

@@ -595,6 +595,22 @@ public sealed class ImportAndRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task GatewayHttpSearchDoesNotExposeLocalFeedback()
+    {
+        const string privateFeedbackMarker = "feedback-private-http-marker";
+        var store = new KnowledgeBaseStore(Db);
+        store.Feedback.Add("other", "useful", "positive", privateFeedbackMarker);
+        _ = CreateExternalSource(store, "Unrelated searchable public source.");
+        var issued = new ClientRegistry(Path.Combine(temp, "clients.json")).Create("external", new[] { "search" });
+        using var server = StartGateway(store, Path.Combine(temp, "state"), Path.Combine(temp, "clients.json"));
+
+        using var response = await Search(server.Client, issued.Token, privateFeedbackMarker, null);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(privateFeedbackMarker, body);
+    }
+
+    [Fact]
     public async Task GatewayHttpReturnsJson413ForChunkedBodyWithoutContentLength()
     {
         var store = new KnowledgeBaseStore(Db); _ = CreateExternalSource(store, "HTTP size evidence.");
